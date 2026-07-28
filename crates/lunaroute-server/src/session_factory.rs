@@ -95,7 +95,23 @@ pub async fn create_session_store(
             }
         }
 
-        let store = lunaroute_session_sqlite::SqliteSessionStore::new(db_path, jsonl_dir).await?;
+        let retention = config
+            .jsonl
+            .as_ref()
+            .map(|jsonl| jsonl.retention.clone())
+            .or_else(|| Some(lunaroute_session::RetentionPolicy::default()));
+        let max_connections = config
+            .sqlite
+            .as_ref()
+            .map(|sqlite| sqlite.max_connections)
+            .unwrap_or(5);
+        let store = lunaroute_session_sqlite::SqliteSessionStore::new_with_config(
+            db_path,
+            jsonl_dir,
+            max_connections,
+            retention,
+        )
+        .await?;
 
         return Ok(Arc::new(store));
     }

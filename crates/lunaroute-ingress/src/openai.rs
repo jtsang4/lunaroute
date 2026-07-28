@@ -1005,34 +1005,28 @@ pub(crate) async fn responses_sse_stream(
     ) {
         use lunaroute_session::{SessionEvent, events::SessionMetadata as V2Metadata};
 
-        // Write Started event asynchronously (spawn task for zero latency)
-        let store = session_store.clone();
-        let sid = session_id.clone();
-        let rid = request_id.clone();
-        let m = model.clone();
-        let ua = user_agent.clone();
-        tokio::spawn(async move {
-            let event = serde_json::to_value(SessionEvent::Started {
-                session_id: sid,
-                request_id: rid,
-                timestamp: chrono::Utc::now(),
-                model_requested: m,
-                provider: "openai".to_string(),
-                listener: "openai".to_string(),
-                is_streaming: true,
-                metadata: V2Metadata {
-                    client_ip: None,
-                    user_agent: ua,
-                    api_version: None,
-                    request_headers: Default::default(),
-                    session_tags: vec![],
-                },
-            })
-            .ok();
-            if let Some(ev) = event {
-                let _ = store.write_event(None, ev).await;
-            }
-        });
+        // Enqueue Started before spawning dependent events. SessionStore writes
+        // are non-blocking, and preserving this order prevents orphan rows.
+        let event = serde_json::to_value(SessionEvent::Started {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            timestamp: chrono::Utc::now(),
+            model_requested: model.clone(),
+            provider: "openai".to_string(),
+            listener: "openai".to_string(),
+            is_streaming: true,
+            metadata: V2Metadata {
+                client_ip: None,
+                user_agent: user_agent.clone(),
+                api_version: None,
+                request_headers: Default::default(),
+                session_tags: vec![],
+            },
+        })
+        .ok();
+        if let Some(event) = event {
+            let _ = session_store.write_event(None, event).await;
+        }
 
         // Record RequestRecorded event asynchronously
         use lunaroute_session::events::RequestStats;
@@ -1672,34 +1666,27 @@ async fn responses_passthrough(
     {
         use lunaroute_session::{SessionEvent, events::SessionMetadata as V2Metadata};
 
-        // Write Started event asynchronously (spawn task for zero latency)
-        let store = session_store.clone();
-        let sid = session_id.clone();
-        let rid = request_id.clone();
-        let m = model.clone();
-        let ua = user_agent.clone();
-        tokio::spawn(async move {
-            let event = serde_json::to_value(SessionEvent::Started {
-                session_id: sid,
-                request_id: rid,
-                timestamp: chrono::Utc::now(),
-                model_requested: m,
-                provider: "openai".to_string(),
-                listener: "openai".to_string(),
-                is_streaming,
-                metadata: V2Metadata {
-                    client_ip: None,
-                    user_agent: ua,
-                    api_version: None,
-                    request_headers: Default::default(),
-                    session_tags: vec![],
-                },
-            })
-            .ok();
-            if let Some(ev) = event {
-                let _ = store.write_event(None, ev).await;
-            }
-        });
+        // Enqueue Started before spawning dependent events.
+        let event = serde_json::to_value(SessionEvent::Started {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            timestamp: chrono::Utc::now(),
+            model_requested: model.clone(),
+            provider: "openai".to_string(),
+            listener: "openai".to_string(),
+            is_streaming,
+            metadata: V2Metadata {
+                client_ip: None,
+                user_agent: user_agent.clone(),
+                api_version: None,
+                request_headers: Default::default(),
+                session_tags: vec![],
+            },
+        })
+        .ok();
+        if let Some(event) = event {
+            let _ = session_store.write_event(None, event).await;
+        }
 
         // Record RequestRecorded event asynchronously
         use lunaroute_session::events::RequestStats;
@@ -2442,48 +2429,39 @@ pub async fn chat_completions_passthrough(
     ) {
         use lunaroute_session::{SessionEvent, events::SessionMetadata as V2Metadata};
 
-        // Write Started event asynchronously (spawn task for zero latency)
-        let store = session_store.clone();
-        let sid = session_id.clone();
-        let rid = request_id.clone();
-        let m = model.clone();
-        let ua = user_agent.clone();
-        let marker_provider_name_for_spawn = marker_provider_name.clone();
-        let state_for_spawn = state.clone();
-        tokio::spawn(async move {
-            let event = serde_json::to_value(SessionEvent::Started {
-                session_id: sid,
-                request_id: rid,
-                timestamp: chrono::Utc::now(),
-                model_requested: m,
-                provider: "openai".to_string(),
-                listener: "openai".to_string(),
-                is_streaming,
-                metadata: V2Metadata {
-                    client_ip: None,
-                    user_agent: ua,
-                    api_version: None,
-                    request_headers: Default::default(),
-                    session_tags: {
-                        let mut tags = vec![];
-                        if let Some(ref provider_name) = marker_provider_name_for_spawn {
-                            tags.push(format!("lunaroute:{}", provider_name));
-                            if let Some(registry) = &state_for_spawn.provider_registry
-                                && let Some(entry) = registry.get(provider_name)
-                                && let Some(ref model) = entry.model_override
-                            {
-                                tags.push(format!("model_override:{}", model));
-                            }
+        // Enqueue Started before spawning dependent events.
+        let event = serde_json::to_value(SessionEvent::Started {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            timestamp: chrono::Utc::now(),
+            model_requested: model.clone(),
+            provider: "openai".to_string(),
+            listener: "openai".to_string(),
+            is_streaming,
+            metadata: V2Metadata {
+                client_ip: None,
+                user_agent: user_agent.clone(),
+                api_version: None,
+                request_headers: Default::default(),
+                session_tags: {
+                    let mut tags = vec![];
+                    if let Some(ref provider_name) = marker_provider_name {
+                        tags.push(format!("lunaroute:{}", provider_name));
+                        if let Some(registry) = &state.provider_registry
+                            && let Some(entry) = registry.get(provider_name)
+                            && let Some(ref model) = entry.model_override
+                        {
+                            tags.push(format!("model_override:{}", model));
                         }
-                        tags
-                    },
+                    }
+                    tags
                 },
-            })
-            .ok();
-            if let Some(ev) = event {
-                let _ = store.write_event(None, ev).await;
-            }
-        });
+            },
+        })
+        .ok();
+        if let Some(event) = event {
+            let _ = session_store.write_event(None, event).await;
+        }
 
         // Record the request
         use lunaroute_session::events::RequestStats;

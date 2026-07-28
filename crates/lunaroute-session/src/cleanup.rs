@@ -324,23 +324,47 @@ pub fn execute_cleanup(directory: &Path, policy: &RetentionPolicy) -> CleanupRes
         }
     }
 
-    // Step 3: Enforce size limit (delete oldest uncompressed first, then compressed)
-    if let Some(max_size_gb) = policy.max_total_size_gb {
-        let max_bytes = (max_size_gb as u64) * 1_073_741_824;
+    // Step 3: Enforce size limit. Re-scan because compression replaced the
+    // original paths and changed their sizes.
+    if let Some(max_bytes) = policy.max_total_size_bytes() {
         let current_usage = calculate_disk_usage(directory)?;
 
         if current_usage.total_bytes > max_bytes {
             let bytes_to_free = current_usage.total_bytes - max_bytes;
             let mut freed = 0u64;
+            let mut files_by_age = Vec::new();
+
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+
+                let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !is_valid_date_directory(dir_name) {
+                    continue;
+                }
+
+                for session_entry in fs::read_dir(path)? {
+                    let session_path = session_entry?.path();
+                    if session_path.is_file() {
+                        files_by_age.push((session_path.clone(), file_age_days(&session_path)?));
+                    }
+                }
+            }
+            files_by_age.sort_by_key(|(_, age)| std::cmp::Reverse(*age));
 
             tracing::warn!(
-                "Disk usage ({:.2} GB) exceeds limit ({} GB), deleting oldest sessions",
+                "Disk usage ({:.2} GB) exceeds limit ({:.2} GB), deleting oldest sessions",
                 current_usage.total_bytes as f64 / 1_073_741_824.0,
-                max_size_gb
+                max_bytes as f64 / 1_073_741_824.0
             );
 
             // Delete oldest files until under the limit
-            for (path, _) in session_files.iter().rev() {
+            for (path, _) in &files_by_age {
                 if freed >= bytes_to_free {
                     break;
                 }
@@ -395,6 +419,12 @@ pub fn spawn_cleanup_task(directory: PathBuf, policy: Arc<RetentionPolicy>) -> C
             directory,
             policy.cleanup_interval_minutes
         );
+
+        // Clean up once at startup so a restart can recover space immediately
+        // instead of waiting for the first interval.
+        if let Err(e) = execute_cleanup(&directory, &policy) {
+            tracing::error!("Initial cleanup task failed: {}", e);
+        }
 
         loop {
             tokio::select! {
@@ -535,6 +565,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -561,6 +592,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: Some(1), // 1 GB
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -594,6 +626,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: Some(1), // Will be treated as 1GB = 1,073,741,824 bytes
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -601,6 +634,40 @@ mod tests {
         // Our test data is only 2.5MB, which is way under 1GB, so nothing should be deleted
         let stats = execute_cleanup(temp_dir.path(), &policy).unwrap();
         assert_eq!(stats.sessions_deleted, 0); // Nothing deleted because we're under limit
+    }
+
+    #[test]
+    fn test_execute_cleanup_megabyte_limit_deletes_oldest_first() {
+        use filetime::{FileTime, set_file_mtime};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let temp_dir = TempDir::new().unwrap();
+        let oldest = create_test_session(temp_dir.path(), "2024-01-01", "oldest", 700_000);
+        let newest = create_test_session(temp_dir.path(), "2024-01-02", "newest", 700_000);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        set_file_mtime(
+            &oldest,
+            FileTime::from_unix_time((now - 2 * 86_400) as i64, 0),
+        )
+        .unwrap();
+        set_file_mtime(&newest, FileTime::from_unix_time((now - 86_400) as i64, 0)).unwrap();
+
+        let policy = RetentionPolicy {
+            max_age_days: None,
+            max_total_size_gb: None,
+            max_total_size_mb: Some(1),
+            compress_after_days: None,
+            cleanup_interval_minutes: 60,
+        };
+
+        let stats = execute_cleanup(temp_dir.path(), &policy).unwrap();
+
+        assert_eq!(stats.sessions_deleted, 1);
+        assert!(!oldest.exists());
+        assert!(newest.exists());
     }
 
     #[test]
@@ -632,6 +699,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: Some(30),
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -671,6 +739,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: Some(7),
             cleanup_interval_minutes: 60,
         };
@@ -726,6 +795,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: Some(30),
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: Some(7),
             cleanup_interval_minutes: 60,
         };
@@ -789,6 +859,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: Some(7),
             cleanup_interval_minutes: 60,
         };
@@ -815,6 +886,7 @@ mod tests {
         let policy = Arc::new(RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 1, // Not used in test, we'll shutdown immediately
         });
@@ -847,6 +919,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -924,6 +997,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };

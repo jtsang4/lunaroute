@@ -1,6 +1,8 @@
 //! SQLite session writer implementation
 
 #[cfg(feature = "sqlite-writer")]
+use crate::config::RetentionPolicy;
+#[cfg(feature = "sqlite-writer")]
 use crate::events::{
     FinalSessionStats, SessionEvent, StreamingStats, TokenTotals, ToolUsageSummary,
 };
@@ -20,15 +22,30 @@ use sqlx::sqlite::{
 use std::collections::HashMap;
 #[cfg(feature = "sqlite-writer")]
 use std::path::Path;
+#[cfg(feature = "sqlite-writer")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "sqlite-writer")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "sqlite-writer")]
 pub struct SqliteWriter {
     pool: SqlitePool,
+    retention: Option<RetentionPolicy>,
+    next_cleanup_at: AtomicU64,
 }
 
 #[cfg(feature = "sqlite-writer")]
 impl SqliteWriter {
     pub async fn new(db_path: &Path) -> WriterResult<Self> {
+        Self::new_with_config(db_path, 5, None).await
+    }
+
+    /// Create a SQLite writer with connection and retention settings.
+    pub async fn new_with_config(
+        db_path: &Path,
+        max_connections: u32,
+        retention: Option<RetentionPolicy>,
+    ) -> WriterResult<Self> {
         // Create directory if needed
         if let Some(parent) = db_path.parent() {
             tokio::fs::create_dir_all(parent)
@@ -37,21 +54,210 @@ impl SqliteWriter {
         }
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(max_connections.max(1))
             .connect_with(
                 SqliteConnectOptions::new()
                     .filename(db_path)
                     .create_if_missing(true)
+                    .foreign_keys(true)
                     .journal_mode(SqliteJournalMode::Wal)
                     .synchronous(SqliteSynchronous::Normal),
             )
             .await
             .map_err(|e| WriterError::Database(e.to_string()))?;
 
+        // Bound WAL growth and make freed pages reclaimable on fresh databases.
+        // The auto_vacuum pragma is harmless for existing databases where the
+        // mode has already been fixed by the schema.
+        sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+            .execute(&pool)
+            .await
+            .map_err(|e| WriterError::Database(e.to_string()))?;
+        sqlx::query("PRAGMA journal_size_limit = 67108864")
+            .execute(&pool)
+            .await
+            .map_err(|e| WriterError::Database(e.to_string()))?;
+
         // Initialize schema
         Self::initialize_schema(&pool).await?;
 
-        Ok(Self { pool })
+        let writer = Self {
+            pool,
+            retention,
+            next_cleanup_at: AtomicU64::new(0),
+        };
+        writer.configure_size_limit().await?;
+        // Run once during startup so a restart reclaims old data immediately.
+        writer.cleanup_retention().await?;
+        writer.schedule_next_cleanup();
+
+        Ok(writer)
+    }
+
+    fn now_epoch_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn schedule_next_cleanup(&self) {
+        let interval_seconds = self
+            .retention
+            .as_ref()
+            .map(|policy| {
+                let configured = u64::from(policy.cleanup_interval_minutes).saturating_mul(60);
+                if policy.max_total_size_bytes().is_some() {
+                    configured.min(60)
+                } else {
+                    configured
+                }
+            })
+            .unwrap_or(u64::MAX);
+        self.next_cleanup_at.store(
+            Self::now_epoch_seconds().saturating_add(interval_seconds),
+            Ordering::Release,
+        );
+    }
+
+    async fn configure_size_limit(&self) -> WriterResult<()> {
+        let Some(max_bytes) = self
+            .retention
+            .as_ref()
+            .and_then(RetentionPolicy::max_total_size_bytes)
+        else {
+            return Ok(());
+        };
+
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| WriterError::Database(e.to_string()))?;
+        let max_pages = (max_bytes / page_size.max(1) as u64).max(1);
+        sqlx::query(&format!("PRAGMA max_page_count = {}", max_pages))
+            .execute(&self.pool)
+            .await
+            .map_err(|e| WriterError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn maybe_cleanup_retention(&self) {
+        let now = Self::now_epoch_seconds();
+        let next = self.next_cleanup_at.load(Ordering::Acquire);
+        if now < next {
+            return;
+        }
+
+        let interval_seconds = self
+            .retention
+            .as_ref()
+            .map(|policy| {
+                let configured = u64::from(policy.cleanup_interval_minutes).saturating_mul(60);
+                if policy.max_total_size_bytes().is_some() {
+                    configured.min(60)
+                } else {
+                    configured
+                }
+            })
+            .unwrap_or(u64::MAX);
+        if self
+            .next_cleanup_at
+            .compare_exchange(
+                next,
+                now.saturating_add(interval_seconds),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        if let Err(error) = self.cleanup_retention().await {
+            tracing::error!(error = %error, "SQLite retention cleanup failed");
+        }
+    }
+
+    async fn cleanup_retention(&self) -> WriterResult<()> {
+        let Some(policy) = &self.retention else {
+            return Ok(());
+        };
+
+        let mut deleted_sessions = 0u64;
+        if let Some(max_age_days) = policy.max_age_days {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(i64::from(max_age_days));
+            deleted_sessions += sqlx::query("DELETE FROM sessions WHERE started_at < ?")
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| WriterError::Database(e.to_string()))?
+                .rows_affected();
+        }
+
+        if let Some(max_bytes) = policy.max_total_size_bytes() {
+            // Keep headroom for a large response and for SQLite's WAL instead
+            // of waiting until the hard page limit has already been reached.
+            let target_bytes = max_bytes.saturating_mul(9) / 10;
+            loop {
+                let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| WriterError::Database(e.to_string()))?;
+                let free_pages: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| WriterError::Database(e.to_string()))?;
+                let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|e| WriterError::Database(e.to_string()))?;
+                let used_bytes = page_count
+                    .saturating_sub(free_pages)
+                    .max(0)
+                    .saturating_mul(page_size.max(0)) as u64;
+
+                if used_bytes <= target_bytes {
+                    break;
+                }
+
+                let result = sqlx::query(
+                    r#"
+                    DELETE FROM sessions
+                    WHERE session_id IN (
+                        SELECT session_id
+                        FROM sessions
+                        ORDER BY started_at ASC
+                        LIMIT 100
+                    )
+                    "#,
+                )
+                .execute(&self.pool)
+                .await
+                .map_err(|e| WriterError::Database(e.to_string()))?;
+                if result.rows_affected() == 0 {
+                    break;
+                }
+                deleted_sessions += result.rows_affected();
+            }
+        }
+
+        if deleted_sessions > 0 {
+            // Return free pages to the filesystem where incremental auto-vacuum
+            // is available, then prevent a stale WAL from retaining disk space.
+            sqlx::query("PRAGMA incremental_vacuum")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| WriterError::Database(e.to_string()))?;
+            let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                .fetch_all(&self.pool)
+                .await;
+            tracing::info!(
+                deleted_sessions,
+                "SQLite session retention cleanup completed"
+            );
+        }
+
+        Ok(())
     }
 
     /// Validate session ID to prevent SQL injection and path traversal attacks
@@ -1533,6 +1739,8 @@ impl SessionWriter for SqliteWriter {
     }
 
     async fn write_batch(&self, events: &[SessionEvent]) -> WriterResult<()> {
+        self.maybe_cleanup_retention().await;
+
         // Validate all session IDs before starting transaction
         for event in events {
             let session_id = match event {
@@ -5292,5 +5500,51 @@ mod tests {
                 .unwrap();
 
         assert_eq!(stored_ua, None);
+    }
+
+    #[tokio::test]
+    async fn test_retention_removes_expired_sessions_on_startup() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_retention.db");
+        let writer = SqliteWriter::new(&db_path).await.unwrap();
+
+        writer
+            .write_event(&SessionEvent::Started {
+                session_id: "expired-session".to_string(),
+                request_id: "expired-request".to_string(),
+                timestamp: Utc::now() - chrono::Duration::days(40),
+                model_requested: "claude-test".to_string(),
+                provider: "anthropic".to_string(),
+                listener: "anthropic".to_string(),
+                is_streaming: false,
+                metadata: SessionMetadata {
+                    client_ip: None,
+                    user_agent: None,
+                    api_version: None,
+                    request_headers: HashMap::new(),
+                    session_tags: Vec::new(),
+                },
+            })
+            .await
+            .unwrap();
+        writer.pool.close().await;
+        drop(writer);
+
+        let policy = RetentionPolicy {
+            max_age_days: Some(30),
+            max_total_size_gb: None,
+            max_total_size_mb: None,
+            compress_after_days: None,
+            cleanup_interval_minutes: 60,
+        };
+        let writer = SqliteWriter::new_with_config(&db_path, 1, Some(policy))
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(&writer.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(count, 0);
     }
 }

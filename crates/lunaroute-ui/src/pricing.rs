@@ -90,10 +90,25 @@ pub struct PricingFetcher {
 
 impl PricingFetcher {
     /// Create a new pricing fetcher with custom cache directory
-    pub fn new(cache_dir: PathBuf) -> Self {
+    pub fn new(mut cache_dir: PathBuf) -> Self {
         // Ensure cache directory exists
         if let Err(e) = fs::create_dir_all(&cache_dir) {
-            eprintln!("Warning: Failed to create pricing cache directory: {}", e);
+            let fallback = std::env::temp_dir()
+                .join(format!("lunaroute-pricing-cache-{}", std::process::id()));
+            tracing::warn!(
+                path = %cache_dir.display(),
+                error = %e,
+                fallback = %fallback.display(),
+                "Pricing cache directory is not writable; using a temporary cache"
+            );
+            cache_dir = fallback;
+            if let Err(fallback_error) = fs::create_dir_all(&cache_dir) {
+                tracing::warn!(
+                    path = %cache_dir.display(),
+                    error = %fallback_error,
+                    "Temporary pricing cache is also unavailable; pricing will use memory only"
+                );
+            }
         }
 
         Self {
@@ -106,11 +121,13 @@ impl PricingFetcher {
         }
     }
 
-    /// Create with default cache directory (~/.lunaroute/pricing_cache)
+    /// Create with the configured or platform-native cache directory.
     pub fn with_default_cache_dir() -> Self {
-        let cache_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".lunaroute")
+        let cache_dir = std::env::var_os("LUNAROUTE_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(dirs::cache_dir)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("lunaroute")
             .join("pricing_cache");
         Self::new(cache_dir)
     }

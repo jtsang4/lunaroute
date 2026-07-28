@@ -88,6 +88,13 @@ pub struct RetentionPolicy {
     #[serde(default)]
     pub max_total_size_gb: Option<u32>,
 
+    /// Maximum total size in megabytes (None = no size limit).
+    ///
+    /// `max_size_mb` is accepted for compatibility with the documented example
+    /// configurations that shipped before this field was implemented.
+    #[serde(default, alias = "max_size_mb")]
+    pub max_total_size_mb: Option<u64>,
+
     /// Enable compression for sessions older than this many days (None = no compression)
     #[serde(default)]
     pub compress_after_days: Option<u32>,
@@ -100,8 +107,9 @@ pub struct RetentionPolicy {
 impl Default for RetentionPolicy {
     fn default() -> Self {
         Self {
-            max_age_days: Some(30),       // Default: 30 days
-            max_total_size_gb: Some(10),  // Default: 10 GB
+            max_age_days: Some(30),      // Default: 30 days
+            max_total_size_gb: Some(10), // Default: 10 GB
+            max_total_size_mb: None,
             compress_after_days: Some(7), // Default: compress after 7 days
             cleanup_interval_minutes: default_cleanup_interval_minutes(),
         }
@@ -115,7 +123,9 @@ fn default_cleanup_interval_minutes() -> u32 {
 impl RetentionPolicy {
     /// Check if this policy has any limits enabled
     pub fn has_limits(&self) -> bool {
-        self.max_age_days.is_some() || self.max_total_size_gb.is_some()
+        self.max_age_days.is_some()
+            || self.max_total_size_gb.is_some()
+            || self.max_total_size_mb.is_some()
     }
 
     /// Check if compression is enabled
@@ -150,11 +160,36 @@ impl RetentionPolicy {
             return Err("max_total_size_gb must be at least 1".to_string());
         }
 
+        if let Some(max_size) = self.max_total_size_mb
+            && max_size == 0
+        {
+            return Err("max_total_size_mb must be at least 1".to_string());
+        }
+
         if self.cleanup_interval_minutes == 0 {
             return Err("cleanup_interval_minutes must be at least 1".to_string());
         }
 
         Ok(())
+    }
+
+    /// Resolve the configured storage limit to bytes.
+    ///
+    /// If both units are configured, the smaller limit wins.
+    pub fn max_total_size_bytes(&self) -> Option<u64> {
+        let gb = self
+            .max_total_size_gb
+            .map(|value| u64::from(value).saturating_mul(1_073_741_824));
+        let mb = self
+            .max_total_size_mb
+            .map(|value| value.saturating_mul(1_048_576));
+
+        match (gb, mb) {
+            (Some(gb), Some(mb)) => Some(gb.min(mb)),
+            (Some(gb), None) => Some(gb),
+            (None, Some(mb)) => Some(mb),
+            (None, None) => None,
+        }
     }
 }
 
@@ -696,6 +731,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: Some(30),
             max_total_size_gb: Some(10),
+            max_total_size_mb: None,
             compress_after_days: Some(7),
             cleanup_interval_minutes: 60,
         };
@@ -707,6 +743,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: Some(7),
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: Some(7), // Equal to max_age
             cleanup_interval_minutes: 60,
         };
@@ -722,6 +759,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: Some(0),
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -730,6 +768,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: Some(0),
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -738,6 +777,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: Some(0),
             cleanup_interval_minutes: 60,
         };
@@ -746,6 +786,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 0,
         };
@@ -757,6 +798,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: None,
             max_total_size_gb: None,
+            max_total_size_mb: None,
             compress_after_days: None,
             cleanup_interval_minutes: 60,
         };
@@ -770,6 +812,7 @@ mod tests {
         let policy = RetentionPolicy {
             max_age_days: Some(15),
             max_total_size_gb: Some(5),
+            max_total_size_mb: None,
             compress_after_days: Some(3),
             cleanup_interval_minutes: 30,
         };
@@ -784,6 +827,17 @@ mod tests {
             policy.cleanup_interval_minutes,
             deserialized.cleanup_interval_minutes
         );
+    }
+
+    #[test]
+    fn test_retention_policy_accepts_documented_max_size_mb() {
+        let policy: RetentionPolicy = serde_json::from_value(serde_json::json!({
+            "max_size_mb": 128
+        }))
+        .unwrap();
+
+        assert_eq!(policy.max_total_size_mb, Some(128));
+        assert_eq!(policy.max_total_size_bytes(), Some(128 * 1_048_576));
     }
 
     #[test]

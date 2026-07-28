@@ -7,13 +7,15 @@ use std::sync::Arc;
 use lunaroute_core::{
     Error, Result,
     session_store::{
-        AggregateStats, CleanupStats, RetentionPolicy, SearchQuery, SearchResults, Session,
-        SessionStore, TimeRange,
+        AggregateStats, CleanupStats, RetentionPolicy as CoreRetentionPolicy, SearchQuery,
+        SearchResults, Session, SessionStore, TimeRange,
     },
     tenant::TenantId,
 };
 
 use lunaroute_session::{
+    cleanup::{CleanupTask, execute_cleanup, spawn_cleanup_task},
+    config::RetentionPolicy as RecordingRetentionPolicy,
     events::SessionEvent, // Use the SessionEvent from lunaroute-session
     jsonl_writer::JsonlWriter,
     sqlite_writer::SqliteWriter,
@@ -33,6 +35,9 @@ pub struct SqliteSessionStore {
     /// JSONL writer for file access (optional - only if JSONL is enabled)
     #[allow(dead_code)]
     jsonl: Option<Arc<JsonlWriter>>,
+    /// Keeps the JSONL retention worker alive for the lifetime of the store.
+    #[allow(dead_code)]
+    cleanup_task: Option<Arc<CleanupTask>>,
 }
 
 impl SqliteSessionStore {
@@ -49,15 +54,65 @@ impl SqliteSessionStore {
         db_path: Option<impl Into<PathBuf>>,
         jsonl_dir: Option<impl Into<PathBuf>>,
     ) -> Result<Self> {
+        let retention =
+            (db_path.is_some() || jsonl_dir.is_some()).then(RecordingRetentionPolicy::default);
+        Self::new_with_config(db_path, jsonl_dir, 5, retention).await
+    }
+
+    /// Create a store and apply the supplied retention policy to JSONL files.
+    pub async fn new_with_retention(
+        db_path: Option<impl Into<PathBuf>>,
+        jsonl_dir: Option<impl Into<PathBuf>>,
+        jsonl_retention: Option<RecordingRetentionPolicy>,
+    ) -> Result<Self> {
+        Self::new_with_config(db_path, jsonl_dir, 5, jsonl_retention).await
+    }
+
+    /// Create a store with explicit SQLite connection and retention settings.
+    pub async fn new_with_config(
+        db_path: Option<impl Into<PathBuf>>,
+        jsonl_dir: Option<impl Into<PathBuf>>,
+        max_connections: u32,
+        retention: Option<RecordingRetentionPolicy>,
+    ) -> Result<Self> {
+        if let Some(policy) = &retention {
+            policy.validate().map_err(|error| {
+                Error::Config(format!("Invalid session retention policy: {}", error))
+            })?;
+        }
+
         let mut writers: Vec<Arc<dyn SessionWriter>> = Vec::new();
+        let jsonl_dir = match jsonl_dir {
+            Some(dir) => Some(expand_tilde(dir.into())?),
+            None => None,
+        };
+
+        // Free JSONL space before opening SQLite. This makes startup capable of
+        // recovering a deployment whose recording volume is already full.
+        if let (Some(directory), Some(policy)) = (&jsonl_dir, &retention) {
+            let directory = directory.clone();
+            let policy = policy.clone();
+            match tokio::task::spawn_blocking(move || execute_cleanup(&directory, &policy)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "Pre-start session cleanup failed");
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "Pre-start session cleanup task failed");
+                }
+            }
+        }
 
         // Create SQLite writer if enabled
         let sqlite = if let Some(path) = db_path {
             let path = expand_tilde(path.into())?;
-            let writer =
-                Arc::new(SqliteWriter::new(&path).await.map_err(|e| {
-                    Error::Database(format!("Failed to create SQLite writer: {}", e))
-                })?);
+            let writer = Arc::new(
+                SqliteWriter::new_with_config(&path, max_connections, retention.clone())
+                    .await
+                    .map_err(|e| {
+                        Error::Database(format!("Failed to create SQLite writer: {}", e))
+                    })?,
+            );
             writers.push(writer.clone() as Arc<dyn SessionWriter>);
             Some(writer)
         } else {
@@ -65,8 +120,9 @@ impl SqliteSessionStore {
         };
 
         // Create JSONL writer if enabled
+        let mut cleanup_directory = None;
         let jsonl = if let Some(dir) = jsonl_dir {
-            let dir = expand_tilde(dir.into())?;
+            cleanup_directory = Some(dir.clone());
             let writer = Arc::new(JsonlWriter::new(dir));
             writers.push(writer.clone() as Arc<dyn SessionWriter>);
             Some(writer)
@@ -91,10 +147,20 @@ impl SqliteSessionStore {
             },
         ));
 
+        let cleanup_task = match (cleanup_directory, retention) {
+            (Some(directory), Some(policy))
+                if policy.has_limits() || policy.compression_enabled() =>
+            {
+                Some(Arc::new(spawn_cleanup_task(directory, Arc::new(policy))))
+            }
+            _ => None,
+        };
+
         Ok(Self {
             recorder,
             sqlite,
             jsonl,
+            cleanup_task,
         })
     }
 
@@ -161,6 +227,7 @@ impl SqliteSessionStore {
             recorder,
             sqlite,
             jsonl: None, // Custom writers don't track JSONL writer
+            cleanup_task: None,
         })
     }
 }
@@ -262,7 +329,7 @@ impl SessionStore for SqliteSessionStore {
     async fn cleanup(
         &self,
         tenant_id: Option<TenantId>,
-        retention: RetentionPolicy,
+        retention: CoreRetentionPolicy,
     ) -> Result<CleanupStats> {
         // Single-tenant mode only
         if tenant_id.is_some() {

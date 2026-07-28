@@ -31,6 +31,15 @@ pub enum WriterError {
 
 pub type WriterResult<T> = Result<T, WriterError>;
 
+impl WriterError {
+    fn is_foreign_key_violation(&self) -> bool {
+        matches!(
+            self,
+            Self::Database(message) if message.contains("FOREIGN KEY constraint failed")
+        )
+    }
+}
+
 /// Trait for session event writers
 #[async_trait]
 pub trait SessionWriter: Send + Sync {
@@ -128,7 +137,12 @@ impl MultiWriterRecorder {
                     }
                 }
                 _ = &mut shutdown_rx => {
-                    // Explicit shutdown signal received, flush remaining and exit
+                    // Explicit shutdown signal received. Drain events that were
+                    // already accepted by the channel before flushing; select!
+                    // may observe shutdown before it observes queued events.
+                    while let Ok(event) = rx.try_recv() {
+                        buffer.push(event);
+                    }
                     tracing::info!("Session recorder received shutdown signal, flushing {} pending events", buffer.len());
                     if !buffer.is_empty() {
                         Self::flush_buffer(&writers, &mut buffer).await;
@@ -165,7 +179,31 @@ impl MultiWriterRecorder {
                 let writer = Arc::clone(writer);
                 async move {
                     if writer.supports_batching() {
-                        writer.write_batch(&events).await
+                        match writer.write_batch(&events).await {
+                            Ok(()) => Ok(()),
+                            Err(error) if events.len() > 1 && error.is_foreign_key_violation() => {
+                                // SQLite batches are transactional. One late/orphaned
+                                // child event must not roll back Started events for every
+                                // other session in the same batch, otherwise the failure
+                                // cascades into subsequent batches.
+                                tracing::warn!(
+                                    event_count = events.len(),
+                                    "Retrying session events individually after foreign-key failure"
+                                );
+                                for event in &events {
+                                    if let Err(event_error) = writer.write_event(event).await {
+                                        tracing::error!(
+                                            session_id = event.session_id(),
+                                            request_id = event.request_id(),
+                                            error = %event_error,
+                                            "Dropping session event that could not be persisted"
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }
+                            Err(error) => Err(error),
+                        }
                     } else {
                         for event in &events {
                             writer.write_event(event).await?;
@@ -354,6 +392,87 @@ pub async fn build_from_config(
     }
 
     Ok(Some(builder.build()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::SessionMetadata;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ForeignKeyBatchWriter {
+        persisted_events: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl SessionWriter for ForeignKeyBatchWriter {
+        async fn write_event(&self, event: &SessionEvent) -> WriterResult<()> {
+            if matches!(event, SessionEvent::ToolCallRecorded { .. }) {
+                return Err(WriterError::Database(
+                    "FOREIGN KEY constraint failed".to_string(),
+                ));
+            }
+            self.persisted_events.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn write_batch(&self, _events: &[SessionEvent]) -> WriterResult<()> {
+            Err(WriterError::Database(
+                "FOREIGN KEY constraint failed".to_string(),
+            ))
+        }
+
+        fn supports_batching(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_key_failure_does_not_drop_other_sessions_in_batch() {
+        let writer = Arc::new(ForeignKeyBatchWriter {
+            persisted_events: AtomicUsize::new(0),
+        });
+        let recorder = MultiWriterRecorder::with_config(
+            vec![writer.clone()],
+            RecorderConfig {
+                batch_size: 2,
+                batch_timeout_ms: 60_000,
+                channel_buffer_size: 10,
+            },
+        );
+
+        assert!(recorder.record_event(SessionEvent::ToolCallRecorded {
+            session_id: "missing-session".to_string(),
+            request_id: "missing-request".to_string(),
+            timestamp: chrono::Utc::now(),
+            tool_name: "Bash".to_string(),
+            tool_call_id: "call-1".to_string(),
+            execution_time_ms: None,
+            input_size_bytes: 0,
+            output_size_bytes: None,
+            success: None,
+            tool_arguments: None,
+        }));
+        assert!(recorder.record_event(SessionEvent::Started {
+            session_id: "valid-session".to_string(),
+            request_id: "valid-request".to_string(),
+            timestamp: chrono::Utc::now(),
+            model_requested: "claude-test".to_string(),
+            provider: "anthropic".to_string(),
+            listener: "anthropic".to_string(),
+            is_streaming: false,
+            metadata: SessionMetadata {
+                client_ip: None,
+                user_agent: None,
+                api_version: None,
+                request_headers: Default::default(),
+                session_tags: Vec::new(),
+            },
+        }));
+
+        recorder.flush().await.unwrap();
+        assert_eq!(writer.persisted_events.load(Ordering::SeqCst), 1);
+    }
 }
 
 /// Build a MultiWriterRecorder from configuration (without SQLite feature)

@@ -1342,12 +1342,8 @@ pub async fn messages_passthrough(
     ) {
         use lunaroute_session::{SessionEvent, events::SessionMetadata as V2Metadata};
 
-        // Record Started event (spawn async to avoid blocking)
-        let store_clone = session_store.clone();
-        let session_id_clone = session_id.clone();
-        let request_id_clone = request_id.clone();
-        let model_clone = model.clone();
-        let user_agent_clone = user_agent.clone();
+        // Enqueue Started before spawning dependent events. SessionStore writes
+        // are non-blocking, and preserving this order prevents orphan rows.
         let session_tags_clone = {
             let mut tags = vec![];
             if let Some(ref provider_name) = marker_provider_name {
@@ -1361,30 +1357,28 @@ pub async fn messages_passthrough(
             }
             tags
         };
-        tokio::spawn(async move {
-            let event = SessionEvent::Started {
-                session_id: session_id_clone,
-                request_id: request_id_clone,
-                timestamp: chrono::Utc::now(),
-                model_requested: model_clone,
-                provider: marker_provider_name
-                    .as_deref()
-                    .unwrap_or("anthropic")
-                    .to_string(),
-                listener: "anthropic".to_string(),
-                is_streaming,
-                metadata: V2Metadata {
-                    client_ip: None,
-                    user_agent: user_agent_clone,
-                    api_version: None,
-                    request_headers: Default::default(),
-                    session_tags: session_tags_clone,
-                },
-            };
-            if let Ok(json) = serde_json::to_value(event) {
-                let _ = store_clone.write_event(None, json).await;
-            }
-        });
+        let event = SessionEvent::Started {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            timestamp: chrono::Utc::now(),
+            model_requested: model.clone(),
+            provider: marker_provider_name
+                .as_deref()
+                .unwrap_or("anthropic")
+                .to_string(),
+            listener: "anthropic".to_string(),
+            is_streaming,
+            metadata: V2Metadata {
+                client_ip: None,
+                user_agent: user_agent.clone(),
+                api_version: None,
+                request_headers: Default::default(),
+                session_tags: session_tags_clone,
+            },
+        };
+        if let Ok(json) = serde_json::to_value(event) {
+            let _ = session_store.write_event(None, json).await;
+        }
 
         // Record the request
         use lunaroute_session::events::RequestStats;
