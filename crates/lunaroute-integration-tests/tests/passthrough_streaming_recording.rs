@@ -11,6 +11,7 @@ mod common;
 use axum::body::Body;
 use axum::http::Request;
 use common::InMemorySessionStore;
+use futures::StreamExt;
 use lunaroute_egress::anthropic::{AnthropicConfig, AnthropicConnector};
 use lunaroute_egress::openai::{OpenAIConfig, OpenAIConnector};
 use lunaroute_session::SessionEvent;
@@ -19,6 +20,393 @@ use std::sync::Arc;
 use tower::ServiceExt;
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn recorded_anthropic_stream(sse: String) -> (String, Vec<SessionEvent>) {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("authorization", "Bearer client-token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let store = Arc::new(InMemorySessionStore::new());
+    let connector = Arc::new(
+        AnthropicConnector::new(AnthropicConfig::new("").with_base_url(server.uri())).unwrap(),
+    );
+    let app = lunaroute_ingress::anthropic::passthrough_router(
+        connector,
+        None,
+        None,
+        Some(store.clone()),
+        15,
+        false,
+        None,
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/messages")
+                .method("POST")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer client-token")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-test",
+                        "messages": [{"role": "user", "content": "Hello"}],
+                        "max_tokens": 20000,
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let events = wait_for_stream_completion(&store).await;
+    (String::from_utf8(bytes.to_vec()).unwrap(), events)
+}
+
+async fn wait_for_stream_completion(store: &InMemorySessionStore) -> Vec<SessionEvent> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let events = store.get_events();
+            if events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Completed { .. }))
+            {
+                return events;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stream completion was recorded")
+}
+
+fn sse_event(value: serde_json::Value) -> String {
+    format!(
+        "event: {}\ndata: {}\n\n",
+        value["type"].as_str().unwrap(),
+        value
+    )
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_records_cumulative_usage_and_cache() {
+    let sse = [
+        json!({"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":9000,"cache_creation_input_tokens":1000}}}),
+        json!({"type":"message_delta","usage":{"input_tokens":25,"output_tokens":12,"cache_creation_input_tokens":1500}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":20}}),
+        json!({"type":"message_stop"}),
+    ].into_iter().map(sse_event).collect();
+    let (_, events) = recorded_anthropic_stream(sse).await;
+    let tokens = events
+        .iter()
+        .find_map(|event| match event {
+            SessionEvent::StatsUpdated {
+                token_updates: Some(tokens),
+                ..
+            } => Some(tokens),
+            _ => None,
+        })
+        .expect("token update");
+    assert_eq!(tokens.total_input, 25);
+    assert_eq!(tokens.total_output, 20);
+    assert_eq!(tokens.total_cache_read, 9000);
+    assert_eq!(tokens.total_cached, 9000);
+    assert_eq!(tokens.total_cache_creation, 1500);
+    assert_eq!(tokens.grand_total, 10545);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Completed {
+            success: true,
+            error: None,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_records_cache_only_usage() {
+    let sse = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":500}}}),
+        json!({"type":"message_stop"}),
+    ].into_iter().map(sse_event).collect();
+    let (_, events) = recorded_anthropic_stream(sse).await;
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::StatsUpdated { token_updates: Some(tokens), .. }
+        if tokens.total_cache_read == 500 && tokens.grand_total == 500)));
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_long_stream_keeps_usage_and_late_tools() {
+    let mut sse = sse_event(
+        json!({"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10,"output_tokens":0}}}),
+    );
+    for _ in 0..10005 {
+        sse.push_str(&sse_event(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}})));
+    }
+    for value in [
+        json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_late","name":"Read","input":{}}}),
+        json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"file_path\":\"/tmp/example\"}"}}),
+        json!({"type":"content_block_stop","index":1}),
+        json!({"type":"future_event","opaque":true}),
+        json!({"type":"ping"}),
+        json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":10005}}),
+        json!({"type":"message_stop"}),
+    ] {
+        sse.push_str(&sse_event(value));
+    }
+    let (body, events) = recorded_anthropic_stream(sse).await;
+    assert_eq!(body.matches("event: content_block_delta").count(), 10006);
+    assert!(body.contains("event: future_event"));
+    assert!(body.contains("event: ping"));
+    assert!(body.contains("event: message_stop"));
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::StatsUpdated { token_updates: Some(tokens), .. }
+        if tokens.total_output == 10005 && tokens.grand_total == 10015)));
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::ToolCallRecorded { tool_call_id, tool_arguments: Some(arguments), .. }
+        if tool_call_id == "toolu_late" && arguments == "{\"file_path\":\"/tmp/example\"}")));
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_records_stream_errors_as_failures() {
+    for trailing_stop in [false, true] {
+        let mut sse = sse_event(
+            json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+        );
+        if trailing_stop {
+            sse.push_str(&sse_event(json!({"type":"message_stop"})));
+        }
+        let (body, events) = recorded_anthropic_stream(sse).await;
+        assert!(body.contains("overloaded_error"));
+        let completions: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::Completed { .. }))
+            .collect();
+        assert_eq!(completions.len(), 1);
+        assert!(
+            matches!(completions[0], SessionEvent::Completed { success: false, error: Some(error), .. } if error.contains("overloaded_error") && error.contains("Overloaded"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_records_incomplete_stream_as_failure() {
+    let (_, events) = recorded_anthropic_stream(sse_event(
+        json!({"type":"message_start","message":{"usage":{"input_tokens":10}}}),
+    ))
+    .await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        SessionEvent::Completed {
+            success: false,
+            error: Some(_),
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_records_transport_errors_and_client_disconnects() {
+    for disconnect_client in [false, true] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(move || async move {
+                let first = futures::stream::once(async {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(sse_event(json!({
+                        "type":"message_start", "message":{"usage":{"input_tokens":10}}
+                    }))))
+                });
+                let interrupted = futures::stream::once(async move {
+                    if disconnect_client {
+                        futures::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    Err::<axum::body::Bytes, _>(std::io::Error::other("upstream disconnected"))
+                });
+                axum::http::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(first.chain(interrupted)))
+                    .unwrap()
+            }),
+        );
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+        let store = Arc::new(InMemorySessionStore::new());
+        let connector = Arc::new(
+            AnthropicConnector::new(
+                AnthropicConfig::new("").with_base_url(format!("http://{address}")),
+            )
+            .unwrap(),
+        );
+        let app = lunaroute_ingress::anthropic::passthrough_router(
+            connector,
+            None,
+            None,
+            Some(store.clone()),
+            15,
+            false,
+            None,
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model":"claude-test","messages":[],"max_tokens":10,"stream":true})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("message_start"));
+        if !disconnect_client {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err()
+            );
+        }
+        drop(stream);
+        let events = wait_for_stream_completion(&store).await;
+        let completions: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::Completed { .. }))
+            .collect();
+        assert_eq!(completions.len(), 1);
+        assert!(matches!(
+            completions[0],
+            SessionEvent::Completed {
+                success: false,
+                error: Some(_),
+                ..
+            }
+        ));
+        assert!(events.iter().any(|event| matches!(event, SessionEvent::StatsUpdated { token_updates: Some(tokens), .. } if tokens.total_input == 10)));
+        server_task.abort();
+        let _ = server_task.await;
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_passthrough_preserves_query_and_client_auth() {
+    for stream in [false, true] {
+        let server = MockServer::start().await;
+        let template = if stream {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_event(json!({"type":"message_stop"})))
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({"type":"message","content":[]}))
+        };
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("authorization", "Bearer client-token"))
+            .respond_with(template)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let connector = Arc::new(
+            AnthropicConnector::new(AnthropicConfig::new("").with_base_url(server.uri())).unwrap(),
+        );
+        let app = lunaroute_ingress::anthropic::passthrough_router(
+            connector, None, None, None, 15, false, None,
+        );
+        let query = "beta=true&tag=a%2Fb&tag=a+b";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/v1/messages?{query}"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer client-token")
+                    .body(Body::from(
+                        json!({"model":"claude-test","messages":[],"max_tokens":1,"stream":stream})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.received_requests().await.unwrap()[0].url.query(),
+            Some(query)
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_bypass_preserves_query_and_client_auth() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages/count_tokens"))
+        .and(header("authorization", "Bearer client-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens":10})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = lunaroute_ingress::BypassProvider::new(
+        server.uri(),
+        String::new(),
+        "anthropic".into(),
+        Arc::new(reqwest::Client::new()),
+        1024,
+    );
+    let app = lunaroute_ingress::with_bypass(
+        axum::Router::new(),
+        Some(Arc::new(provider)),
+        Arc::new(lunaroute_routing::PathClassifier::new(true)),
+    );
+    let query = "beta=true&tag=a%2Fb&tag=a+b";
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/messages/count_tokens?{query}"))
+                .header("authorization", "Bearer client-token")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        server.received_requests().await.unwrap()[0].url.query(),
+        Some(query)
+    );
+}
 
 #[tokio::test]
 async fn test_openai_passthrough_streaming_with_recording() {

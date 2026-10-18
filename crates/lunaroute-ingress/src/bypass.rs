@@ -151,6 +151,13 @@ async fn bypass_handler_impl(
         path, provider.name
     );
 
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(&path)
+        .to_string();
+
     // Extract headers and body
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
@@ -165,7 +172,7 @@ async fn bypass_handler_impl(
     };
 
     // Proxy the request
-    proxy_request(&provider, &path, method, headers, body_bytes).await
+    proxy_request(&provider, &path_and_query, method, headers, body_bytes).await
 }
 
 /// Direct proxy a request to the bypass provider

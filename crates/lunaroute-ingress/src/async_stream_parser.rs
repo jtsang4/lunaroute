@@ -5,19 +5,19 @@
 //!
 //! ## Key Features
 //!
-//! - **Zero-latency**: Client receives responses immediately, parsing happens in background
+//! - **Streaming**: Responses are forwarded while a background task parses events
 //! - **Deduplication**: Uses tool IDs to prevent over-counting tool calls
 //! - **Panic recovery**: Background tasks catch and log panics without affecting client
-//! - **Memory bounded**: Respects event collection limits to prevent OOM
+//! - **Bounded buffering**: Anthropic events are consumed through a bounded channel
 //!
 //! ## Design
 //!
 //! In passthrough mode, we maintain 100% API fidelity by forwarding responses without
 //! modification. To still capture metrics, we:
 //!
-//! 1. Collect SSE events during streaming (up to MAX_COLLECTED_EVENTS)
-//! 2. Spawn background task after client receives full response
-//! 3. Parse events asynchronously to extract tokens and tool calls
+//! 1. Consume Anthropic events incrementally while forwarding the response
+//! 2. Parse OpenAI events collected during streaming
+//! 3. Extract cumulative tokens and tool calls
 //! 4. Emit StatsUpdated event to update database records
 
 use futures::StreamExt;
@@ -44,6 +44,23 @@ pub struct ParsedStreamData {
     pub content_blocks: usize,
     pub has_refusal: bool,
     pub tool_calls: Vec<ToolCallInfo>,
+}
+
+fn update_anthropic_usage(tokens: &mut TokenTotals, usage: &serde_json::Value) {
+    for (name, total) in [
+        ("input_tokens", &mut tokens.total_input),
+        ("output_tokens", &mut tokens.total_output),
+        ("cache_read_input_tokens", &mut tokens.total_cache_read),
+        (
+            "cache_creation_input_tokens",
+            &mut tokens.total_cache_creation,
+        ),
+    ] {
+        if let Some(value) = usage.get(name).and_then(|value| value.as_u64()) {
+            *total = value;
+        }
+    }
+    tokens.total_cached = tokens.total_cache_read;
 }
 
 /// Parse Anthropic SSE stream to extract tokens and tool calls
@@ -78,11 +95,8 @@ where
                 if let Some("message_start") = json.get("type").and_then(|t| t.as_str())
                     && let Some(message) = json.get("message")
                 {
-                    // Input tokens
-                    if let Some(usage) = message.get("usage")
-                        && let Some(input) = usage.get("input_tokens").and_then(|t| t.as_u64())
-                    {
-                        data.tokens.total_input = input;
+                    if let Some(usage) = message.get("usage") {
+                        update_anthropic_usage(&mut data.tokens, usage);
                     }
                     // Model
                     if let Some(model) = message.get("model").and_then(|m| m.as_str()) {
@@ -90,12 +104,10 @@ where
                     }
                 }
 
-                // Extract output tokens from message_delta
+                // Usage updates are cumulative and may omit unchanged fields.
                 if let Some("message_delta") = json.get("type").and_then(|t| t.as_str()) {
-                    if let Some(usage) = json.get("usage")
-                        && let Some(output) = usage.get("output_tokens").and_then(|t| t.as_u64())
-                    {
-                        data.tokens.total_output = output;
+                    if let Some(usage) = json.get("usage") {
+                        update_anthropic_usage(&mut data.tokens, usage);
                     }
 
                     // Check for refusal in stop_reason
@@ -191,7 +203,10 @@ where
     }
 
     // Calculate grand total
-    data.tokens.grand_total = data.tokens.total_input + data.tokens.total_output;
+    data.tokens.grand_total = data.tokens.total_input
+        + data.tokens.total_cache_read
+        + data.tokens.total_cache_creation
+        + data.tokens.total_output;
 
     data
 }
@@ -365,7 +380,7 @@ where
 
 /// Spawn async parsing task for Anthropic stream
 ///
-/// Returns immediately, parsing happens in background without blocking client response.
+/// Returns a task handle that completes after the recording events are written.
 ///
 /// **Panic Safety**: Uses `catch_unwind` to prevent panics from crashing the server.
 /// All errors are logged with session ID for debugging.
@@ -380,7 +395,7 @@ pub fn spawn_anthropic_parser<E>(
     session_store: Arc<dyn SessionStore>,
     user_agent: Option<String>,
     tool_call_mapper: Option<Arc<lunaroute_session::ToolCallMapper>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Catch and log any panics/errors in background parsing
         let session_id_for_error = session_id.clone();
@@ -394,31 +409,21 @@ pub fn spawn_anthropic_parser<E>(
                     mapper.record_call(tool_call.tool_call_id.clone(), tool_call.tool_name.clone());
                 }
 
-                let store_clone = session_store.clone();
-                let session_id_clone = session_id.clone();
-                let request_id_clone = request_id.clone();
-                let tool_name = tool_call.tool_name.clone();
-                let tool_call_id = tool_call.tool_call_id.clone();
-                let input_size = tool_call.tool_arguments.len();
-                let tool_arguments = tool_call.tool_arguments.clone();
-
-                tokio::spawn(async move {
-                    let event = lunaroute_session::SessionEvent::ToolCallRecorded {
-                        session_id: session_id_clone,
-                        request_id: request_id_clone,
-                        timestamp: chrono::Utc::now(),
-                        tool_name,
-                        tool_call_id,
-                        execution_time_ms: None,
-                        input_size_bytes: input_size,
-                        output_size_bytes: None,
-                        success: None,
-                        tool_arguments: Some(tool_arguments),
-                    };
-                    if let Ok(json) = serde_json::to_value(event) {
-                        let _ = store_clone.write_event(None, json).await;
-                    }
-                });
+                let event = lunaroute_session::SessionEvent::ToolCallRecorded {
+                    session_id: session_id.clone(),
+                    request_id: request_id.clone(),
+                    timestamp: chrono::Utc::now(),
+                    tool_name: tool_call.tool_name.clone(),
+                    tool_call_id: tool_call.tool_call_id.clone(),
+                    execution_time_ms: None,
+                    input_size_bytes: tool_call.tool_arguments.len(),
+                    output_size_bytes: None,
+                    success: None,
+                    tool_arguments: Some(tool_call.tool_arguments.clone()),
+                };
+                if let Ok(json) = serde_json::to_value(event) {
+                    let _ = session_store.write_event(None, json).await;
+                }
             }
 
             // Only record StatsUpdated if we found meaningful data
@@ -430,35 +435,29 @@ pub fn spawn_anthropic_parser<E>(
                     parsed.tool_calls.len()
                 );
 
-                let store_clone = session_store.clone();
-                let session_id_clone = session_id.clone();
-                let request_id_clone = request_id.clone();
-
-                tokio::spawn(async move {
-                    let event = lunaroute_session::SessionEvent::StatsUpdated {
-                        session_id: session_id_clone,
-                        request_id: request_id_clone,
-                        timestamp: chrono::Utc::now(),
-                        token_updates: if parsed.tokens.grand_total > 0 {
-                            Some(parsed.tokens)
-                        } else {
-                            None
-                        },
-                        tool_call_updates: if parsed.tool_summary.total_tool_calls > 0 {
-                            Some(parsed.tool_summary)
-                        } else {
-                            None
-                        },
-                        model_used: parsed.model_used,
-                        response_size_bytes: parsed.response_size_bytes,
-                        content_blocks: parsed.content_blocks,
-                        has_refusal: parsed.has_refusal,
-                        user_agent,
-                    };
-                    if let Ok(json) = serde_json::to_value(event) {
-                        let _ = store_clone.write_event(None, json).await;
-                    }
-                });
+                let event = lunaroute_session::SessionEvent::StatsUpdated {
+                    session_id: session_id.clone(),
+                    request_id: request_id.clone(),
+                    timestamp: chrono::Utc::now(),
+                    token_updates: if parsed.tokens.grand_total > 0 {
+                        Some(parsed.tokens)
+                    } else {
+                        None
+                    },
+                    tool_call_updates: if parsed.tool_summary.total_tool_calls > 0 {
+                        Some(parsed.tool_summary)
+                    } else {
+                        None
+                    },
+                    model_used: parsed.model_used,
+                    response_size_bytes: parsed.response_size_bytes,
+                    content_blocks: parsed.content_blocks,
+                    has_refusal: parsed.has_refusal,
+                    user_agent,
+                };
+                if let Ok(json) = serde_json::to_value(event) {
+                    let _ = session_store.write_event(None, json).await;
+                }
             }
         });
 
@@ -469,7 +468,7 @@ pub fn spawn_anthropic_parser<E>(
                 e
             );
         }
-    });
+    })
 }
 
 /// Spawn async parsing task for OpenAI stream

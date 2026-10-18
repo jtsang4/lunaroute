@@ -3,7 +3,7 @@
 use crate::types::{IngressError, IngressResult};
 use axum::{
     Router,
-    extract::{Json, State},
+    extract::{Json, RawQuery, State},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -26,9 +26,6 @@ use std::sync::Arc;
 
 /// Maximum size for tool arguments (1MB)
 const MAX_TOOL_ARGS_SIZE: usize = 1_000_000;
-
-/// Maximum number of SSE events to collect for async parsing (prevents OOM on very long streams)
-const MAX_COLLECTED_EVENTS: usize = 10_000;
 
 /// Extract a session ID from `metadata.user_id`. Handles three shapes the
 /// Anthropic client has used:
@@ -1168,12 +1165,19 @@ pub struct PassthroughState {
     pub provider_registry: Option<Arc<crate::ProviderRegistry>>,
 }
 
+#[derive(Default)]
+struct PassthroughStreamStatus {
+    message_stopped: bool,
+    error: Option<String>,
+}
+
 /// Passthrough handler for Anthropic→Anthropic routing (no normalization)
 /// Takes raw JSON, sends directly to Anthropic, returns raw JSON
 /// Preserves 100% API fidelity while still extracting metrics
 pub async fn messages_passthrough(
     State(state): State<Arc<PassthroughState>>,
     headers: axum::http::HeaderMap,
+    RawQuery(query): RawQuery,
     Json(req): Json<serde_json::Value>,
 ) -> Result<Response, IngressError> {
     let start_time = std::time::Instant::now();
@@ -1626,7 +1630,7 @@ pub async fn messages_passthrough(
         // Handle streaming passthrough
         let connector = override_connector.as_ref().unwrap_or(&state.connector);
         let stream_response = connector
-            .stream_passthrough(req, passthrough_headers)
+            .stream_passthrough_with_query(req, passthrough_headers, query.as_deref())
             .await
             .map_err(|e| IngressError::ProviderError(e.to_string()))?;
 
@@ -1686,210 +1690,231 @@ pub async fn messages_passthrough(
         let byte_stream = stream_response.bytes_stream();
         let sse_stream = eventsource_stream::EventStream::new(byte_stream);
 
-        // Collect events for async parsing (zero-copy - just storing references)
-        let collected_events: Arc<std::sync::Mutex<Vec<eventsource_stream::Event>>> =
-            Arc::new(std::sync::Mutex::new(Vec::new()));
-        let events_for_parsing = collected_events.clone();
+        let stream_status = Arc::new(std::sync::Mutex::new(PassthroughStreamStatus::default()));
+        let parser_sender = if let (Some(session_store), Some(session_id), Some(request_id)) = (
+            state.session_store.clone(),
+            recording_session_id.clone(),
+            recording_request_id.clone(),
+        ) {
+            // Backpressure bounds queued events while retaining usage and tools from the whole stream.
+            let (sender, receiver) = tokio::sync::mpsc::channel::<
+                Result<
+                    eventsource_stream::Event,
+                    eventsource_stream::EventStreamError<std::convert::Infallible>,
+                >,
+            >(128);
+            let events = futures::stream::unfold(receiver, |mut receiver| async move {
+                receiver.recv().await.map(|event| (event, receiver))
+            })
+            .boxed();
+            let parser_task = crate::async_stream_parser::spawn_anthropic_parser(
+                events,
+                session_id.clone(),
+                request_id.clone(),
+                session_store.clone(),
+                user_agent.clone(),
+                Some(state.tool_call_mapper.clone()),
+            );
+            let status = stream_status.clone();
+            let metrics = state.metrics.clone();
+            let model = model.clone();
+            tokio::spawn(async move {
+                use lunaroute_session::{
+                    SessionEvent,
+                    events::{
+                        FinalSessionStats, PerformanceMetrics, TokenTotals, ToolUsageSummary,
+                    },
+                };
 
-        let tracked_stream = sse_stream.map(move |event_result| {
-            match event_result {
-                Ok(event) => {
-                    let now = std::time::Instant::now();
-
-                    // Track TTFT on first chunk
-                    tracker_ref.record_ttft(now);
-
-                    // Track chunk latency with memory bounds
-                    let _ = tracker_ref.record_chunk_latency(now, "anthropic", &model_clone, &metrics_clone);
-
-                    // Increment chunk count
-                    tracker_ref.increment_chunk_count();
-
-                    // Parse event data to extract text and metadata
-                    if let Ok(anthropic_event) = serde_json::from_str::<serde_json::Value>(&event.data) {
-                        // Extract text deltas (with size limit to prevent OOM)
-                        if let Some("content_block_delta") = anthropic_event.get("type").and_then(|t| t.as_str())
-                            && let Some("text_delta") = anthropic_event.get("delta").and_then(|d| d.get("type")).and_then(|t| t.as_str())
-                            && let Some(text) = anthropic_event.get("delta").and_then(|d| d.get("text")).and_then(|t| t.as_str())
-                        {
-                            tracker_ref.accumulate_text(text, "anthropic", &model_clone, &metrics_clone);
+                let parser_result = parser_task.await;
+                let error = {
+                    let status = status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    status.error.clone().or_else(|| {
+                        if let Err(error) = parser_result {
+                            Some(format!("Anthropic stream recording failed: {error}"))
+                        } else if !status.message_stopped {
+                            Some("Anthropic stream ended before message_stop".to_string())
+                        } else {
+                            None
                         }
+                    })
+                };
+                let finalized = tracker_for_finalize.finalize(start_time, before_provider);
+                finalized.record_to_prometheus(&metrics, "anthropic", &model);
 
-                        // Extract model from message_start
-                        if let Some("message_start") = anthropic_event.get("type").and_then(|t| t.as_str())
-                            && let Some(model_str) = anthropic_event.get("message").and_then(|m| m.get("model")).and_then(|m| m.as_str())
-                        {
-                            tracker_ref.set_model(model_str.to_string());
-                        }
-
-                        // Extract finish reason from message_delta
-                        if let Some("message_delta") = anthropic_event.get("type").and_then(|t| t.as_str())
-                            && let Some(reason) = anthropic_event.get("delta").and_then(|d| d.get("stop_reason")).and_then(|r| r.as_str())
-                        {
-                            tracker_ref.set_finish_reason(reason.to_string());
-                        }
-                    }
-
-                    // Collect event for async parsing (clone for background processing)
-                    match collected_events.lock() {
-                        Ok(mut events) => {
-                            if events.len() < MAX_COLLECTED_EVENTS {
-                                events.push(event.clone());
-                            } else if events.len() == MAX_COLLECTED_EVENTS {
-                                tracing::warn!("Event collection limit reached ({}), stopping collection to prevent OOM", MAX_COLLECTED_EVENTS);
-                                events.push(event.clone()); // Push one more so we can detect we hit the limit
-                            }
-                            // Silently drop events after limit+1
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to acquire event collection lock (poisoned): {}", e);
-                        }
-                    }
-
-                    // Forward the event exactly as received (preserve event type, id, data)
-                    let mut sse_event = Event::default();
-
-                    // Preserve event type (e.g., "message_start", "content_block_delta")
-                    if !event.event.is_empty() {
-                        sse_event = sse_event.event(event.event.clone());
-                    }
-
-                    // Preserve event ID if present
-                    if !event.id.is_empty() {
-                        sse_event = sse_event.id(event.id.clone());
-                    }
-
-                    // Forward data as-is (don't re-parse/re-serialize)
-                    Ok(sse_event.data(event.data.clone()))
-                }
-                Err(e) => {
-                    Err(IngressError::Internal(format!("SSE stream error: {}", e)))
-                }
-            }
-        });
-
-        // Add completion handler to record session stats when stream ends
-        let store_clone = state.session_store.clone();
-        let session_id_clone = recording_session_id.clone();
-        let request_id_clone = recording_request_id.clone();
-        let start_clone = start_time;
-        let before_provider_clone = before_provider;
-        let tool_call_mapper_for_parser = state.tool_call_mapper.clone();
-
-        // Clone SSE config before state is moved
-        let sse_keepalive_interval = state.sse_keepalive_interval_secs;
-        let sse_keepalive_enabled_flag = state.sse_keepalive_enabled;
-
-        let completion_stream = tracked_stream.chain(futures::stream::once(async move {
-            // Record StreamStarted and Completed events after stream ends
-            if let (Some(session_store), Some(session_id), Some(request_id)) =
-                (store_clone.as_ref(), session_id_clone.as_ref(), request_id_clone.as_ref())
-            {
-                use lunaroute_session::{SessionEvent, events::{FinalSessionStats, TokenTotals, ToolUsageSummary, PerformanceMetrics}};
-
-                // Finalize streaming metrics using tracker
-                let finalized = tracker_for_finalize.finalize(start_clone, before_provider_clone);
-
-                // Record Prometheus metrics
-                finalized.record_to_prometheus(&state.metrics, "anthropic", &model);
-
-                // Record StreamStarted event (async)
                 if finalized.ttft_ms > 0 {
-                    let store_for_event = session_store.clone();
-                    let sid = session_id.clone();
-                    let rid = request_id.clone();
-                    let ttft = finalized.ttft_ms;
-                    tokio::spawn(async move {
-                        let event = SessionEvent::StreamStarted {
-                            session_id: sid,
-                            request_id: rid,
-                            timestamp: chrono::Utc::now(),
-                            time_to_first_token_ms: ttft,
-                        };
-                        if let Ok(json) = serde_json::to_value(event) {
-                            let _ = store_for_event.write_event(None, json).await;
-                        }
-                    });
-                }
-
-                // Record Completed event with streaming_stats (async)
-                let store_for_completed = session_store.clone();
-                let sid_completed = session_id.clone();
-                let rid_completed = request_id.clone();
-                let fin_clone = finalized.clone();
-                tokio::spawn(async move {
-                    let event = SessionEvent::Completed {
-                        session_id: sid_completed,
-                        request_id: rid_completed,
+                    let event = SessionEvent::StreamStarted {
+                        session_id: session_id.clone(),
+                        request_id: request_id.clone(),
                         timestamp: chrono::Utc::now(),
-                        success: true,
-                        error: None,
-                        finish_reason: fin_clone.finish_reason.clone(),
-                        final_stats: Box::new(FinalSessionStats {
-                            total_duration_ms: fin_clone.total_duration_ms,
-                            provider_time_ms: fin_clone.total_duration_ms, // Entire duration is provider time in streaming
-                            proxy_overhead_ms: 0.0, // Minimal overhead in passthrough mode
-                            total_tokens: TokenTotals::default(), // Tokens will be updated by async parser
-                            tool_summary: ToolUsageSummary::default(), // Tool calls will be updated by async parser
-                            performance: PerformanceMetrics::default(),
-                            streaming_stats: Some(fin_clone.to_streaming_stats()),
-                            estimated_cost: None,
-                        }),
+                        time_to_first_token_ms: finalized.ttft_ms,
                     };
                     if let Ok(json) = serde_json::to_value(event) {
-                        let _ = store_for_completed.write_event(None, json).await;
+                        let _ = session_store.write_event(None, json).await;
                     }
-                });
+                }
+                let event = SessionEvent::Completed {
+                    session_id,
+                    request_id,
+                    timestamp: chrono::Utc::now(),
+                    success: error.is_none(),
+                    error,
+                    finish_reason: finalized.finish_reason.clone(),
+                    final_stats: Box::new(FinalSessionStats {
+                        total_duration_ms: finalized.total_duration_ms,
+                        provider_time_ms: finalized.total_duration_ms,
+                        proxy_overhead_ms: 0.0,
+                        total_tokens: TokenTotals::default(),
+                        tool_summary: ToolUsageSummary::default(),
+                        performance: PerformanceMetrics::default(),
+                        streaming_stats: Some(finalized.to_streaming_stats()),
+                        estimated_cost: None,
+                    }),
+                };
+                if let Ok(json) = serde_json::to_value(event) {
+                    let _ = session_store.write_event(None, json).await;
+                }
+            });
+            Some(sender)
+        } else {
+            None
+        };
 
-                // Spawn async parser to extract tokens and tool calls (zero latency for client)
-                match events_for_parsing.lock() {
-                    Ok(mut events) if !events.is_empty() => {
-                        // Take ownership of events vec instead of cloning (reduces memory usage)
-                        let events_vec = std::mem::take(&mut *events);
-                        // Use Infallible error type since we already have successfully parsed events
-                        let event_stream = futures::stream::iter(
-                            events_vec.into_iter().map(Ok::<_, eventsource_stream::EventStreamError<std::convert::Infallible>>)
+        let tracked_stream = sse_stream.then(move |event_result| {
+            let parser_sender = parser_sender.clone();
+            let tracker_ref = tracker_ref.clone();
+            let metrics_clone = metrics_clone.clone();
+            let model_clone = model_clone.clone();
+            let stream_status = stream_status.clone();
+            async move {
+                match event_result {
+                    Ok(event) => {
+                        let now = std::time::Instant::now();
+
+                        // Track TTFT on first chunk
+                        tracker_ref.record_ttft(now);
+
+                        // Track chunk latency with memory bounds
+                        let _ = tracker_ref.record_chunk_latency(
+                            now,
+                            "anthropic",
+                            &model_clone,
+                            &metrics_clone,
                         );
-                        crate::async_stream_parser::spawn_anthropic_parser(
-                            event_stream,
-                            session_id.clone(),
-                            request_id.clone(),
-                            session_store.clone(),
-                            user_agent.clone(),
-                            Some(tool_call_mapper_for_parser.clone()), // Pass mapper to record tool calls
-                        );
-                    }
-                    Ok(_) => {
-                        // Empty events, nothing to parse
+
+                        // Increment chunk count
+                        tracker_ref.increment_chunk_count();
+
+                        // Parse event data to extract text and metadata
+                        if let Ok(anthropic_event) =
+                            serde_json::from_str::<serde_json::Value>(&event.data)
+                        {
+                            {
+                                let mut status = stream_status
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                match anthropic_event.get("type").and_then(|value| value.as_str()) {
+                                    Some("error") => {
+                                        status.error.get_or_insert_with(|| {
+                                            anthropic_event
+                                                .get("error")
+                                                .unwrap_or(&anthropic_event)
+                                                .to_string()
+                                        });
+                                    }
+                                    Some("message_stop") => status.message_stopped = true,
+                                    _ => {}
+                                }
+                            }
+                            // Extract text deltas (with size limit to prevent OOM)
+                            if let Some("content_block_delta") =
+                                anthropic_event.get("type").and_then(|t| t.as_str())
+                                && let Some("text_delta") = anthropic_event
+                                    .get("delta")
+                                    .and_then(|d| d.get("type"))
+                                    .and_then(|t| t.as_str())
+                                && let Some(text) = anthropic_event
+                                    .get("delta")
+                                    .and_then(|d| d.get("text"))
+                                    .and_then(|t| t.as_str())
+                            {
+                                tracker_ref.accumulate_text(
+                                    text,
+                                    "anthropic",
+                                    &model_clone,
+                                    &metrics_clone,
+                                );
+                            }
+
+                            // Extract model from message_start
+                            if let Some("message_start") =
+                                anthropic_event.get("type").and_then(|t| t.as_str())
+                                && let Some(model_str) = anthropic_event
+                                    .get("message")
+                                    .and_then(|m| m.get("model"))
+                                    .and_then(|m| m.as_str())
+                            {
+                                tracker_ref.set_model(model_str.to_string());
+                            }
+
+                            // Extract finish reason from message_delta
+                            if let Some("message_delta") =
+                                anthropic_event.get("type").and_then(|t| t.as_str())
+                                && let Some(reason) = anthropic_event
+                                    .get("delta")
+                                    .and_then(|d| d.get("stop_reason"))
+                                    .and_then(|r| r.as_str())
+                            {
+                                tracker_ref.set_finish_reason(reason.to_string());
+                            }
+                        }
+
+                        if let Some(sender) = parser_sender {
+                            let _ = sender.send(Ok(event.clone())).await;
+                        }
+
+                        // Forward the event exactly as received (preserve event type, id, data)
+                        let mut sse_event = Event::default();
+
+                        // Preserve event type (e.g., "message_start", "content_block_delta")
+                        if !event.event.is_empty() {
+                            sse_event = sse_event.event(event.event.clone());
+                        }
+
+                        // Preserve event ID if present
+                        if !event.id.is_empty() {
+                            sse_event = sse_event.id(event.id.clone());
+                        }
+
+                        // Forward data as-is (don't re-parse/re-serialize)
+                        Ok(sse_event.data(event.data.clone()))
                     }
                     Err(e) => {
-                        tracing::error!("Failed to acquire event collection lock for async parsing (poisoned): {}", e);
+                        let error = format!("SSE stream error: {e}");
+                        stream_status
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .error
+                            .get_or_insert(error.clone());
+                        Err(IngressError::Internal(error))
                     }
                 }
             }
-
-            // Return empty event to complete the stream
-            Err(IngressError::Internal("Stream completed".to_string()))
-        }));
-
-        // Filter out the completion marker
-        let final_stream = completion_stream.filter_map(|result| {
-            futures::future::ready(match result {
-                Ok(event) => Some(Ok(event)),
-                Err(e) if e.to_string().contains("Stream completed") => None,
-                Err(e) => Some(Err(e)),
-            })
         });
 
         // Create SSE response with configured keepalive
-        let sse_keepalive = if sse_keepalive_enabled_flag {
-            KeepAlive::new().interval(std::time::Duration::from_secs(sse_keepalive_interval))
+        let sse_keepalive = if state.sse_keepalive_enabled {
+            KeepAlive::new().interval(std::time::Duration::from_secs(
+                state.sse_keepalive_interval_secs,
+            ))
         } else {
             // Disable keepalive by setting a very long interval
             KeepAlive::new().interval(std::time::Duration::from_secs(86400)) // 24 hours
         };
 
-        let sse_response = Sse::new(final_stream).keep_alive(sse_keepalive);
+        let sse_response = Sse::new(tracked_stream).keep_alive(sse_keepalive);
         let mut response = sse_response.into_response();
 
         // Add the response headers from Anthropic
@@ -1900,7 +1925,9 @@ pub async fn messages_passthrough(
 
     // Send directly to Anthropic API (non-streaming)
     let connector = override_connector.as_ref().unwrap_or(&state.connector);
-    let response_result = connector.send_passthrough(req, passthrough_headers).await;
+    let response_result = connector
+        .send_passthrough_with_query(req, passthrough_headers, query.as_deref())
+        .await;
 
     let (response_status, raw_response_bytes, response_headers) = match response_result {
         Ok((status, bytes, headers)) => (status, bytes, headers),

@@ -89,6 +89,15 @@ impl AnthropicConnector {
         Ok(Self { config, client })
     }
 
+    fn messages_url(&self, query: Option<&str>) -> String {
+        let mut url = format!("{}/v1/messages", self.config.base_url);
+        if let Some(query) = query {
+            url.push('?');
+            url.push_str(query);
+        }
+        url
+    }
+
     /// Send a raw JSON request directly to Anthropic (passthrough mode)
     /// Returns the raw response status, bytes and headers for true transparent proxying.
     /// Error responses (non-2xx) are passed through unchanged - the client handles them.
@@ -97,6 +106,18 @@ impl AnthropicConnector {
         &self,
         request_json: serde_json::Value,
         headers: std::collections::HashMap<String, String>,
+    ) -> Result<(u16, bytes::Bytes, std::collections::HashMap<String, String>)> {
+        self.send_passthrough_with_query(request_json, headers, None)
+            .await
+    }
+
+    /// Send a passthrough request with the client's raw query string.
+    #[instrument(skip(self, request_json, headers, query))]
+    pub async fn send_passthrough_with_query(
+        &self,
+        request_json: serde_json::Value,
+        headers: std::collections::HashMap<String, String>,
+        query: Option<&str>,
     ) -> Result<(u16, bytes::Bytes, std::collections::HashMap<String, String>)> {
         debug!("Sending passthrough request to Anthropic (no normalization)");
 
@@ -125,7 +146,7 @@ impl AnthropicConnector {
 
         let mut request_builder = self
             .client
-            .post(format!("{}/v1/messages", self.config.base_url))
+            .post(self.messages_url(query))
             .header("Content-Type", "application/json");
 
         // If we have a configured API key, filter out client auth headers and use our key
@@ -246,6 +267,18 @@ impl AnthropicConnector {
         request_json: serde_json::Value,
         headers: std::collections::HashMap<String, String>,
     ) -> Result<reqwest::Response> {
+        self.stream_passthrough_with_query(request_json, headers, None)
+            .await
+    }
+
+    /// Stream a passthrough request with the client's raw query string.
+    #[instrument(skip(self, request_json, headers, query))]
+    pub async fn stream_passthrough_with_query(
+        &self,
+        request_json: serde_json::Value,
+        headers: std::collections::HashMap<String, String>,
+        query: Option<&str>,
+    ) -> Result<reqwest::Response> {
         debug!("Sending passthrough streaming request to Anthropic (no normalization)");
 
         // Log request headers and body at debug level
@@ -269,7 +302,7 @@ impl AnthropicConnector {
 
         let mut request_builder = self
             .client
-            .post(format!("{}/v1/messages", self.config.base_url))
+            .post(self.messages_url(query))
             .header("Content-Type", "application/json");
 
         // If we have a configured API key, filter out client auth headers and use our key
