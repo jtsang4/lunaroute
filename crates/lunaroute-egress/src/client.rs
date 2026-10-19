@@ -118,6 +118,7 @@ pub fn create_client(config: &HttpClientConfig) -> Result<Client> {
         .no_gzip()
         .no_brotli()
         .no_deflate()
+        .no_zstd()
         // Build the client
         .build()
         .map_err(|e| EgressError::ConfigError(format!("Failed to create HTTP client: {}", e)))

@@ -46,7 +46,7 @@ pub struct ParsedStreamData {
     pub tool_calls: Vec<ToolCallInfo>,
 }
 
-fn update_anthropic_usage(tokens: &mut TokenTotals, usage: &serde_json::Value) {
+pub(crate) fn update_anthropic_usage(tokens: &mut TokenTotals, usage: &serde_json::Value) {
     for (name, total) in [
         ("input_tokens", &mut tokens.total_input),
         ("output_tokens", &mut tokens.total_output),
@@ -61,6 +61,54 @@ fn update_anthropic_usage(tokens: &mut TokenTotals, usage: &serde_json::Value) {
         }
     }
     tokens.total_cached = tokens.total_cache_read;
+}
+
+/// Decode a buffered response for recording, bounding every intermediate representation.
+pub(crate) fn decode_response_body(
+    raw: &[u8],
+    content_encoding: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    if raw.len() > max_bytes {
+        return Err(format!(
+            "response exceeds recording limit of {max_bytes} bytes"
+        ));
+    }
+    let mut body = raw.to_vec();
+    for encoding in content_encoding.split(',').rev() {
+        let encoding = encoding.trim().to_ascii_lowercase();
+        let mut decoder: Box<dyn Read + '_> = match encoding.as_str() {
+            "" | "identity" => continue,
+            "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(body.as_slice())),
+            "deflate" => Box::new(flate2::read::ZlibDecoder::new(body.as_slice())),
+            "br" => Box::new(brotli::Decompressor::new(body.as_slice(), 4096)),
+            "zstd" => {
+                let mut decoder = zstd::stream::read::Decoder::new(body.as_slice())
+                    .map_err(|error| format!("invalid zstd response: {error}"))?;
+                decoder
+                    .window_log_max(25)
+                    .map_err(|error| format!("invalid zstd window: {error}"))?;
+                Box::new(decoder)
+            }
+            _ => return Err(format!("unsupported response content encoding: {encoding}")),
+        };
+        let mut decoded = Vec::new();
+        decoder
+            .by_ref()
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut decoded)
+            .map_err(|error| format!("invalid {encoding} response: {error}"))?;
+        if decoded.len() > max_bytes {
+            return Err(format!(
+                "decoded response exceeds recording limit of {max_bytes} bytes"
+            ));
+        }
+        drop(decoder);
+        body = decoded;
+    }
+    Ok(body)
 }
 
 /// Parse Anthropic SSE stream to extract tokens and tool calls
@@ -584,6 +632,79 @@ pub fn spawn_openai_parser<E>(
 mod tests {
     use super::*;
     use futures::stream;
+
+    #[test]
+    fn test_response_decoding_enforces_limits_at_each_stage() {
+        use std::io::Write;
+        let body = vec![b'a'; 1024];
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(&body).unwrap();
+        let gzip = gzip.finish().unwrap();
+        assert_eq!(decode_response_body(&body, "identity", 1024).unwrap(), body);
+        assert!(
+            decode_response_body(&body, "", 1023)
+                .unwrap_err()
+                .contains("limit")
+        );
+        assert_eq!(decode_response_body(&gzip, " GZip ", 1024).unwrap(), body);
+        assert!(
+            decode_response_body(&gzip, "gzip", 1023)
+                .unwrap_err()
+                .contains("limit")
+        );
+        let stacked = zstd::stream::encode_all(gzip.as_slice(), 1).unwrap();
+        assert_eq!(
+            decode_response_body(&stacked, "gzip, zstd", 1024).unwrap(),
+            body
+        );
+        assert!(
+            decode_response_body(&stacked, "gzip, zstd", 100)
+                .unwrap_err()
+                .contains("limit")
+        );
+
+        // The inner compressed representation can be larger than the final content.
+        let gzip = flate2::GzBuilder::new()
+            .extra(vec![0; 1024])
+            .write(Vec::new(), flate2::Compression::fast())
+            .finish()
+            .unwrap();
+        let stacked = zstd::stream::encode_all(gzip.as_slice(), 1).unwrap();
+        assert!(stacked.len() < 100);
+        assert!(
+            decode_response_body(&stacked, "gzip, zstd", 100)
+                .unwrap_err()
+                .contains("limit")
+        );
+    }
+
+    #[test]
+    fn test_response_decoding_rejects_corrupt_and_unknown_encodings() {
+        for encoding in ["gzip", "deflate", "br", "zstd", "unknown"] {
+            assert!(
+                decode_response_body(b"invalid compressed body", encoding, 1024).is_err(),
+                "{encoding}"
+            );
+        }
+        use std::io::Write;
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(b"{}").unwrap();
+        let mut gzip = gzip.finish().unwrap();
+        gzip.pop();
+        assert!(decode_response_body(&gzip, "gzip", 1024).is_err());
+    }
+
+    #[test]
+    fn test_response_decoding_consumes_all_gzip_members() {
+        use std::io::Write;
+        let mut encoded = Vec::new();
+        for part in [b"{", b"}"] {
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            gzip.write_all(part).unwrap();
+            encoded.extend(gzip.finish().unwrap());
+        }
+        assert_eq!(decode_response_body(&encoded, "gzip", 1024).unwrap(), b"{}");
+    }
 
     #[tokio::test]
     async fn test_parse_anthropic_stream_with_tokens() {

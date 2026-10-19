@@ -106,7 +106,7 @@ impl AnthropicConnector {
         &self,
         request_json: serde_json::Value,
         headers: std::collections::HashMap<String, String>,
-    ) -> Result<(u16, bytes::Bytes, std::collections::HashMap<String, String>)> {
+    ) -> Result<(u16, bytes::Bytes, reqwest::header::HeaderMap)> {
         self.send_passthrough_with_query(request_json, headers, None)
             .await
     }
@@ -118,7 +118,7 @@ impl AnthropicConnector {
         request_json: serde_json::Value,
         headers: std::collections::HashMap<String, String>,
         query: Option<&str>,
-    ) -> Result<(u16, bytes::Bytes, std::collections::HashMap<String, String>)> {
+    ) -> Result<(u16, bytes::Bytes, reqwest::header::HeaderMap)> {
         debug!("Sending passthrough request to Anthropic (no normalization)");
 
         // Log request headers and body at debug level
@@ -198,7 +198,7 @@ impl AnthropicConnector {
     async fn handle_anthropic_passthrough_response(
         &self,
         response: reqwest::Response,
-    ) -> Result<(u16, bytes::Bytes, std::collections::HashMap<String, String>)> {
+    ) -> Result<(u16, bytes::Bytes, reqwest::header::HeaderMap)> {
         let status_code = response.status().as_u16();
 
         if !response.status().is_success() {
@@ -206,12 +206,7 @@ impl AnthropicConnector {
         }
 
         // Capture response headers before consuming the response
-        let mut headers_map = std::collections::HashMap::new();
-        for (name, value) in response.headers() {
-            if let Ok(value_str) = value.to_str() {
-                headers_map.insert(name.to_string(), value_str.to_string());
-            }
-        }
+        let headers_map = response.headers().clone();
 
         // Get raw bytes for transparent passthrough
         let raw_bytes = response.bytes().await.map_err(|e| {
@@ -221,40 +216,11 @@ impl AnthropicConnector {
             ))
         })?;
 
-        // Optionally parse for debug logging (decompress if gzipped)
-        if tracing::enabled!(tracing::Level::DEBUG) {
-            let bytes_for_logging = if headers_map
-                .get("content-encoding")
-                .map(|v| v.to_lowercase().contains("gzip"))
-                .unwrap_or(false)
-            {
-                use flate2::read::GzDecoder;
-                use std::io::Read;
-
-                let mut decoder = GzDecoder::new(&raw_bytes[..]);
-                let mut decompressed = Vec::new();
-                if decoder.read_to_end(&mut decompressed).is_ok() {
-                    decompressed
-                } else {
-                    raw_bytes.to_vec()
-                }
-            } else {
-                raw_bytes.to_vec()
-            };
-
-            if let Ok(json_value) = serde_json::from_slice::<serde_json::Value>(&bytes_for_logging)
-            {
-                debug!("┌─────────────────────────────────────────────────────────");
-                debug!("│ Anthropic Passthrough Response Body (parsed for logging)");
-                debug!("├─────────────────────────────────────────────────────────");
-                debug!(
-                    "│ {}",
-                    serde_json::to_string_pretty(&json_value)
-                        .unwrap_or_else(|_| "Failed to serialize".to_string())
-                );
-                debug!("└─────────────────────────────────────────────────────────");
-            }
-        }
+        debug!(
+            status_code,
+            response_size_bytes = raw_bytes.len(),
+            "Received Anthropic passthrough response"
+        );
 
         Ok((status_code, raw_bytes, headers_map))
     }

@@ -67,6 +67,7 @@ prometheus = "0.14"
 zstd = "0.13"
 lz4 = "1.24"
 flate2 = "1.0"
+brotli = "8.0"
 base64 = "0.22"
 
 # Cryptography

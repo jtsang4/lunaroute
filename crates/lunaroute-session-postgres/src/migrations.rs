@@ -493,13 +493,11 @@ mod tests {
 
     #[test]
     fn test_migrations_are_sequential() {
-        let mut expected_version = 1;
-        for migration in MIGRATIONS {
+        for (expected_version, migration) in (1..).zip(MIGRATIONS.iter()) {
             assert_eq!(
                 migration.version, expected_version,
                 "Migration versions must be sequential"
             );
-            expected_version += 1;
         }
     }
 

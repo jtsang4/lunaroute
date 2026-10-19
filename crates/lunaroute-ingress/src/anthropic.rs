@@ -1171,6 +1171,256 @@ struct PassthroughStreamStatus {
     error: Option<String>,
 }
 
+/// Headers for a new HTTP connection and body framing chosen by the server.
+fn forwardable_headers(headers: &axum::http::HeaderMap) -> axum::http::HeaderMap {
+    let mut forwarded = headers.clone();
+    for value in headers.get_all(axum::http::header::CONNECTION) {
+        if let Ok(value) = value.to_str() {
+            for name in value.split(',') {
+                if let Ok(name) = axum::http::HeaderName::from_bytes(name.trim().as_bytes()) {
+                    forwarded.remove(name);
+                }
+            }
+        }
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+    ] {
+        forwarded.remove(name);
+    }
+    forwarded
+}
+
+async fn record_passthrough_error(
+    state: &PassthroughState,
+    session_id: &Option<String>,
+    request_id: &Option<String>,
+    started: std::time::Instant,
+    error: String,
+) {
+    if let (Some(store), Some(session_id), Some(request_id)) =
+        (&state.session_store, session_id, request_id)
+    {
+        let event = lunaroute_session::SessionEvent::Completed {
+            session_id: session_id.clone(),
+            request_id: request_id.clone(),
+            timestamp: chrono::Utc::now(),
+            success: false,
+            error: Some(error),
+            finish_reason: None,
+            final_stats: Box::new(lunaroute_session::events::FinalSessionStats {
+                total_duration_ms: started.elapsed().as_millis() as u64,
+                provider_time_ms: 0,
+                proxy_overhead_ms: 0.0,
+                total_tokens: Default::default(),
+                tool_summary: Default::default(),
+                performance: Default::default(),
+                streaming_stats: None,
+                estimated_cost: None,
+            }),
+        };
+        if let Ok(event) = serde_json::to_value(event) {
+            let _ = store.write_event(None, event).await;
+        }
+    }
+}
+
+fn spawn_passthrough_response_recording(
+    state: &PassthroughState,
+    session_id: &Option<String>,
+    request_id: &Option<String>,
+    response: (u16, bytes::Bytes, axum::http::HeaderMap),
+    timings: (std::time::Instant, std::time::Instant),
+    user_agent: Option<String>,
+) {
+    let (Some(store), Some(session_id), Some(request_id)) = (
+        state.session_store.clone(),
+        session_id.clone(),
+        request_id.clone(),
+    ) else {
+        return;
+    };
+    let (status, bytes, headers) = response;
+    let total_duration_ms = timings.0.elapsed().as_millis() as u64;
+    let provider_time_ms = timings.1.elapsed().as_millis() as u64;
+    let timestamp = chrono::Utc::now();
+    let encoding = headers
+        .get_all("content-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    let upstream_request_id = headers
+        .get("request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| format!(", request_id={value}"))
+        .unwrap_or_default();
+
+    tokio::spawn(async move {
+        use lunaroute_session::{
+            SessionEvent,
+            events::{FinalSessionStats, TokenTotals, ToolStats, ToolUsageSummary},
+        };
+        let mut tokens = TokenTotals::default();
+        let mut tool_summary = ToolUsageSummary::default();
+        let mut finish_reason = None;
+        let mut error_type = None;
+        let parse_result = std::panic::AssertUnwindSafe(async {
+            let (response, response_size_bytes) = tokio::task::spawn_blocking(move || {
+                // Recording has its own budget; compressed bytes are forwarded unchanged.
+                let decoded = crate::async_stream_parser::decode_response_body(
+                    &bytes,
+                    &encoding,
+                    32 * 1024 * 1024,
+                )?;
+                let response = serde_json::from_slice::<serde_json::Value>(&decoded)
+                    .map_err(|error| format!("invalid response JSON: {error}"))?;
+                Ok::<_, String>((response, decoded.len()))
+            })
+            .await
+            .map_err(|error| format!("response parser task failed: {error}"))??;
+            error_type = response
+                .pointer("/error/type")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            finish_reason = response
+                .get("stop_reason")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            if let Some(usage) = response.get("usage") {
+                crate::async_stream_parser::update_anthropic_usage(&mut tokens, usage);
+                tokens.total_thinking = usage
+                    .get("thinking_tokens")
+                    .or_else(|| usage.get("extended_thinking_tokens"))
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+            }
+            tokens.grand_total = tokens.total_input
+                + tokens.total_output
+                + tokens.total_cache_read
+                + tokens.total_cache_creation;
+            let content = response.get("content").and_then(|value| value.as_array());
+            for block in content.into_iter().flatten() {
+                if block.get("type").and_then(|value| value.as_str()) != Some("tool_use") {
+                    continue;
+                }
+                let Some(name) = block.get("name").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                tool_summary
+                    .by_tool
+                    .entry(name.to_string())
+                    .or_insert_with(|| ToolStats {
+                        call_count: 0,
+                        total_execution_time_ms: 0,
+                        avg_execution_time_ms: 0,
+                        error_count: 0,
+                    })
+                    .call_count += 1;
+                tool_summary.total_tool_calls += 1;
+                if let Some(id) = block.get("id").and_then(|value| value.as_str()) {
+                    let arguments = block
+                        .get("input")
+                        .unwrap_or(&serde_json::Value::Null)
+                        .to_string();
+                    let event = SessionEvent::ToolCallRecorded {
+                        session_id: session_id.clone(),
+                        request_id: request_id.clone(),
+                        timestamp,
+                        tool_name: name.to_string(),
+                        tool_call_id: id.to_string(),
+                        execution_time_ms: None,
+                        input_size_bytes: arguments.len(),
+                        output_size_bytes: None,
+                        success: None,
+                        tool_arguments: Some(arguments),
+                    };
+                    if let Ok(event) = serde_json::to_value(event) {
+                        let _ = store.write_event(None, event).await;
+                    }
+                }
+            }
+            tool_summary.unique_tool_count = tool_summary.by_tool.len() as u32;
+            let event = SessionEvent::StatsUpdated {
+                session_id: session_id.clone(),
+                request_id: request_id.clone(),
+                timestamp,
+                token_updates: Some(tokens.clone()),
+                tool_call_updates: Some(tool_summary.clone()),
+                model_used: response
+                    .get("model")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                response_size_bytes,
+                content_blocks: content.map_or(0, Vec::len),
+                has_refusal: finish_reason.as_deref() == Some("refusal"),
+                user_agent,
+            };
+            if let Ok(event) = serde_json::to_value(event) {
+                let _ = store.write_event(None, event).await;
+            }
+            Ok::<_, String>(())
+        });
+        let parse_error = match futures::FutureExt::catch_unwind(parse_result).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_) => Some("response parser panicked".to_string()),
+        };
+        let mut error = if !(200..300).contains(&status) {
+            Some(format!(
+                "Anthropic HTTP {status}{}{}",
+                error_type
+                    .map(|kind| format!(" ({kind})"))
+                    .unwrap_or_default(),
+                upstream_request_id
+            ))
+        } else {
+            None
+        };
+        if let Some(parse_error) = parse_error {
+            let message = format!(
+                "Anthropic response recording failed (HTTP {status}{upstream_request_id}): {parse_error}"
+            );
+            tracing::warn!(session_id, request_id, "{message}");
+            error = Some(match error {
+                Some(error) => format!("{error}; {message}"),
+                None => message,
+            });
+        }
+        let event = SessionEvent::Completed {
+            session_id,
+            request_id,
+            timestamp,
+            success: error.is_none(),
+            error,
+            finish_reason,
+            final_stats: Box::new(FinalSessionStats {
+                total_duration_ms,
+                provider_time_ms,
+                proxy_overhead_ms: total_duration_ms.saturating_sub(provider_time_ms) as f64,
+                total_tokens: tokens,
+                tool_summary,
+                performance: Default::default(),
+                streaming_stats: None,
+                estimated_cost: None,
+            }),
+        };
+        if let Ok(event) = serde_json::to_value(event) {
+            let _ = store.write_event(None, event).await;
+        }
+    });
+}
+
 /// Passthrough handler for Anthropic→Anthropic routing (no normalization)
 /// Takes raw JSON, sends directly to Anthropic, returns raw JSON
 /// Preserves 100% API fidelity while still extracting metrics
@@ -1262,37 +1512,17 @@ pub async fn messages_passthrough(
         .and_then(|m| m.get("user_id"))
         .and_then(extract_session_id_from_user_id);
 
-    // Pass through ALL headers from the client (except hop-by-hop headers)
-    // This allows client to provide auth headers if no API key is configured
-    let mut passthrough_headers = std::collections::HashMap::new();
-
-    // Headers that should NOT be forwarded (hop-by-hop headers per RFC 7230)
-    let skip_headers = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "host",
-        "content-length",
-    ];
-
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-
-        // Skip hop-by-hop headers
-        if skip_headers.contains(&name_str.as_str()) {
-            continue;
-        }
-
-        // Forward all other headers including authorization
-        if let Ok(value_str) = value.to_str() {
-            passthrough_headers.insert(name.as_str().to_string(), value_str.to_string());
-        }
-    }
+    let mut request_headers = forwardable_headers(&headers);
+    request_headers.remove("host");
+    let passthrough_headers = request_headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect();
 
     let is_streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -1629,24 +1859,55 @@ pub async fn messages_passthrough(
     if is_streaming {
         // Handle streaming passthrough
         let connector = override_connector.as_ref().unwrap_or(&state.connector);
-        let stream_response = connector
+        let stream_response = match connector
             .stream_passthrough_with_query(req, passthrough_headers, query.as_deref())
             .await
-            .map_err(|e| IngressError::ProviderError(e.to_string()))?;
+        {
+            Ok(response) => response,
+            Err(error) => {
+                record_passthrough_error(
+                    &state,
+                    &recording_session_id,
+                    &recording_request_id,
+                    start_time,
+                    error.to_string(),
+                )
+                .await;
+                return Err(IngressError::ProviderError(error.to_string()));
+            }
+        };
 
         // If the response is an error (non-2xx), pass it through as a raw response
         // instead of trying to set up SSE streaming. Error responses from Anthropic
         // are regular JSON, not SSE streams, and clients expect them in native format.
         if !stream_response.status().is_success() {
             let status_code = stream_response.status().as_u16();
-            let mut response_headers = axum::http::HeaderMap::new();
-            for (name, value) in stream_response.headers() {
-                response_headers.insert(name.clone(), value.clone());
-            }
-            let body_bytes = stream_response
-                .bytes()
-                .await
-                .map_err(|e| IngressError::Internal(format!("Failed to read error body: {}", e)))?;
+            let response_headers = stream_response.headers().clone();
+            let body_bytes = match stream_response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    let error = format!(
+                        "Failed to read Anthropic HTTP {status_code} response body: {error}"
+                    );
+                    record_passthrough_error(
+                        &state,
+                        &recording_session_id,
+                        &recording_request_id,
+                        start_time,
+                        error.clone(),
+                    )
+                    .await;
+                    return Err(IngressError::ProviderError(error));
+                }
+            };
+            spawn_passthrough_response_recording(
+                &state,
+                &recording_session_id,
+                &recording_request_id,
+                (status_code, body_bytes.clone(), response_headers.clone()),
+                (start_time, before_provider),
+                user_agent,
+            );
 
             let mut axum_response = axum::http::Response::builder()
                 .status(status_code)
@@ -1654,28 +1915,14 @@ pub async fn messages_passthrough(
                 .map_err(|e| {
                     IngressError::Internal(format!("Failed to build error response: {}", e))
                 })?;
-            *axum_response.headers_mut() = response_headers;
+            *axum_response.headers_mut() = forwardable_headers(&response_headers);
             return Ok(axum_response);
         }
 
-        // Extract and forward response headers from Anthropic, excluding content-related
-        // headers that axum's SSE will set correctly.
-        // The SSE response body is reconstructed by axum (not raw bytes from Anthropic),
-        // so content-encoding, content-length, and transfer-encoding would be incorrect.
-        let mut response_headers = axum::http::HeaderMap::new();
-
-        for (name, value) in stream_response.headers() {
-            let name_str = name.as_str();
-            // Skip headers that axum's SSE response will set correctly
-            if name_str == "content-encoding"
-                || name_str == "content-length"
-                || name_str == "transfer-encoding"
-                || name_str == "content-type"
-            {
-                continue;
-            }
-            response_headers.insert(name.clone(), value.clone());
-        }
+        let mut response_headers = forwardable_headers(stream_response.headers());
+        // Axum reconstructs SSE, so only its content metadata describes the new body.
+        response_headers.remove("content-encoding");
+        response_headers.remove("content-type");
 
         // Track streaming metrics using shared module
         use crate::streaming_metrics::StreamingMetricsTracker;
@@ -1931,46 +2178,16 @@ pub async fn messages_passthrough(
 
     let (response_status, raw_response_bytes, response_headers) = match response_result {
         Ok((status, bytes, headers)) => (status, bytes, headers),
-        Err(e) => {
-            // Record error in session if recording is enabled
-            if let (Some(session_store), Some(session_id), Some(request_id)) = (
-                &state.session_store,
+        Err(error) => {
+            record_passthrough_error(
+                &state,
                 &recording_session_id,
                 &recording_request_id,
-            ) {
-                use lunaroute_session::{SessionEvent, events::FinalSessionStats};
-
-                // Record error async (spawn to avoid blocking)
-                let store_clone = session_store.clone();
-                let sid = session_id.clone();
-                let rid = request_id.clone();
-                let error_msg = e.to_string();
-                let elapsed = start_time.elapsed().as_millis() as u64;
-                tokio::spawn(async move {
-                    let event = SessionEvent::Completed {
-                        session_id: sid,
-                        request_id: rid,
-                        timestamp: chrono::Utc::now(),
-                        success: false,
-                        error: Some(error_msg),
-                        finish_reason: None,
-                        final_stats: Box::new(FinalSessionStats {
-                            total_duration_ms: elapsed,
-                            provider_time_ms: 0,
-                            proxy_overhead_ms: 0.0,
-                            total_tokens: Default::default(),
-                            tool_summary: Default::default(),
-                            performance: Default::default(),
-                            streaming_stats: None,
-                            estimated_cost: None,
-                        }),
-                    };
-                    if let Ok(json) = serde_json::to_value(event) {
-                        let _ = store_clone.write_event(None, json).await;
-                    }
-                });
-            }
-            return Err(IngressError::ProviderError(e.to_string()));
+                start_time,
+                error.to_string(),
+            )
+            .await;
+            return Err(IngressError::ProviderError(error.to_string()));
         }
     };
 
@@ -1981,276 +2198,21 @@ pub async fn messages_passthrough(
         provider_time.as_secs_f64() * 1000.0
     );
 
-    // Build response with raw bytes and ALL headers from Anthropic FIRST (zero latency)
-    // This ensures true transparent proxying - client gets exact response from Anthropic
-    // Use the actual status code from Anthropic (not hardcoded 200)
+    // Preserve the upstream status and encoded bytes; Axum frames the new HTTP response.
     let mut axum_response = axum::http::Response::builder()
         .status(response_status)
         .body(axum::body::Body::from(raw_response_bytes.clone()))
         .map_err(|e| IngressError::Internal(format!("Failed to build response: {}", e)))?;
 
-    let axum_headers = axum_response.headers_mut();
-
-    // Forward ALL Anthropic response headers (content-type, content-encoding, etc.)
-    for (name, value) in &response_headers {
-        if let Ok(header_name) = axum::http::HeaderName::from_bytes(name.as_bytes())
-            && let Ok(header_value) = axum::http::HeaderValue::from_str(value)
-        {
-            axum_headers.insert(header_name, header_value);
-        }
-    }
-
-    // Spawn async parsing task (zero latency for client)
-    if let (Some(session_store), Some(session_id), Some(request_id)) = (
-        state.session_store.clone(),
-        recording_session_id.clone(),
-        recording_request_id.clone(),
-    ) {
-        let raw_bytes = raw_response_bytes.clone();
-        let response_headers_clone = response_headers.clone();
-        let user_agent_clone = user_agent.clone();
-
-        tokio::spawn(async move {
-            // Catch and log any panics/errors in background parsing
-            let session_id_for_error = session_id.clone();
-            let parse_result = std::panic::AssertUnwindSafe(async move {
-                // Parse response asynchronously (doesn't block client)
-                // Use spawn_blocking for gzip decompression to avoid blocking tokio threads
-                let is_gzipped = response_headers_clone
-                    .get("content-encoding")
-                    .map(|v| v.to_lowercase().contains("gzip"))
-                    .unwrap_or(false);
-
-                let bytes_for_parsing = if is_gzipped {
-                    let raw_bytes_clone = raw_bytes.clone();
-                    match tokio::task::spawn_blocking(move || {
-                        use flate2::read::GzDecoder;
-                        use std::io::Read;
-
-                        let mut decoder = GzDecoder::new(&raw_bytes_clone[..]);
-                        let mut decompressed = Vec::new();
-                        decoder.read_to_end(&mut decompressed).map(|_| decompressed)
-                    })
-                    .await
-                    {
-                        Ok(Ok(decompressed)) => decompressed,
-                        Ok(Err(e)) => {
-                            tracing::warn!(
-                                "Failed to decompress gzip response in async parser: {}",
-                                e
-                            );
-                            return;
-                        }
-                        Err(e) => {
-                            tracing::error!("Gzip decompression task failed: {}", e);
-                            return;
-                        }
-                    }
-                } else {
-                    raw_bytes.to_vec()
-                };
-
-                let response_json: serde_json::Value =
-                    match serde_json::from_slice(&bytes_for_parsing) {
-                        Ok(json) => json,
-                        Err(e) => {
-                            tracing::warn!("Failed to parse response JSON in async parser: {}", e);
-                            return;
-                        }
-                    };
-
-                // Extract tokens with cache details
-                let (input_tokens, output_tokens, thinking_tokens, _cache_creation, cache_read) =
-                    if let Some(usage) = response_json.get("usage") {
-                        let input = usage
-                            .get("input_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        let output = usage
-                            .get("output_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-
-                        // Extract thinking tokens (extended thinking, not cache!)
-                        let thinking = usage
-                            .get("thinking_tokens")
-                            .and_then(|v| v.as_u64())
-                            .or_else(|| {
-                                usage
-                                    .get("extended_thinking_tokens")
-                                    .and_then(|v| v.as_u64())
-                            })
-                            .unwrap_or(0);
-
-                        // Extract cache tokens separately
-                        let cache_create = usage
-                            .get("cache_creation_input_tokens")
-                            .and_then(|v| v.as_u64());
-                        let cache_hit = usage
-                            .get("cache_read_input_tokens")
-                            .and_then(|v| v.as_u64());
-
-                        (input, output, thinking, cache_create, cache_hit)
-                    } else {
-                        (0, 0, 0, None, None)
-                    };
-
-                // Extract tool calls and count content blocks
-                let mut tool_calls_map = std::collections::HashMap::new();
-                let mut content_blocks = 0;
-                let mut has_refusal = false;
-                if let Some(content) = response_json.get("content").and_then(|c| c.as_array()) {
-                    content_blocks = content.len();
-                    for block in content {
-                        if let Some("tool_use") = block.get("type").and_then(|t| t.as_str())
-                            && let Some(tool_name) = block.get("name").and_then(|n| n.as_str())
-                        {
-                            *tool_calls_map.entry(tool_name.to_string()).or_insert(0u32) += 1;
-
-                            // Emit ToolCallRecorded event for each tool call
-                            if let Some(tool_id) = block.get("id").and_then(|id| id.as_str()) {
-                                let input_value =
-                                    block.get("input").unwrap_or(&serde_json::Value::Null);
-                                let input_str =
-                                    serde_json::to_string(input_value).unwrap_or_default();
-                                let input_size = input_str.len();
-
-                                // Record tool call async (spawn to avoid blocking)
-                                let store_for_tool = session_store.clone();
-                                let sid = session_id.clone();
-                                let rid = request_id.clone();
-                                let tool_name_str = tool_name.to_string();
-                                let tool_id_str = tool_id.to_string();
-                                let input_str_clone = input_str.clone();
-                                tokio::spawn(async move {
-                                    let event = lunaroute_session::SessionEvent::ToolCallRecorded {
-                                        session_id: sid,
-                                        request_id: rid,
-                                        timestamp: chrono::Utc::now(),
-                                        tool_name: tool_name_str,
-                                        tool_call_id: tool_id_str,
-                                        execution_time_ms: None, // Model just requested the call
-                                        input_size_bytes: input_size,
-                                        output_size_bytes: None, // No result yet
-                                        success: None,           // Unknown until client executes
-                                        tool_arguments: Some(input_str_clone), // Store arguments
-                                    };
-                                    if let Ok(json) = serde_json::to_value(event) {
-                                        let _ = store_for_tool.write_event(None, json).await;
-                                    }
-                                });
-                            }
-                        }
-                    }
-                }
-
-                // Check for refusal in stop_reason
-                if let Some(stop_reason) = response_json.get("stop_reason").and_then(|s| s.as_str())
-                {
-                    has_refusal = stop_reason == "end_turn"; // Simplified - actual refusal detection may vary
-                }
-
-                // Extract model
-                let model_used = response_json
-                    .get("model")
-                    .and_then(|m| m.as_str())
-                    .map(|s| s.to_string());
-
-                // Calculate response size
-                let response_size_bytes = bytes_for_parsing.len();
-
-                // Build updates if we have meaningful data
-                let has_tokens = input_tokens > 0 || output_tokens > 0;
-                let has_tools = !tool_calls_map.is_empty();
-
-                if has_tokens || has_tools || model_used.is_some() {
-                    use lunaroute_session::events::{TokenTotals, ToolStats, ToolUsageSummary};
-
-                    let token_updates = if has_tokens {
-                        let cache_r = cache_read.unwrap_or(0);
-                        let cache_c = _cache_creation.unwrap_or(0);
-                        Some(TokenTotals {
-                            total_input: input_tokens,
-                            total_output: output_tokens,
-                            total_thinking: thinking_tokens, // Anthropic extended thinking tokens
-                            total_reasoning: 0, // Anthropic doesn't have reasoning tokens (that's OpenAI)
-                            total_cached: cache_r, // Deprecated field, kept for backward compat
-                            total_cache_read: cache_r, // Anthropic cache hits (90% discount)
-                            total_cache_creation: cache_c, // Anthropic cache writes (25% markup)
-                            total_audio_input: 0, // Anthropic doesn't have audio tokens yet
-                            total_audio_output: 0,
-                            grand_total: input_tokens + output_tokens + thinking_tokens,
-                            by_model: Default::default(),
-                        })
-                    } else {
-                        None
-                    };
-
-                    let tool_summary = if has_tools {
-                        let total_calls: u32 = tool_calls_map.values().sum();
-                        let mut by_tool = std::collections::HashMap::new();
-                        for (name, count) in tool_calls_map {
-                            by_tool.insert(
-                                name,
-                                ToolStats {
-                                    call_count: count,
-                                    total_execution_time_ms: 0,
-                                    avg_execution_time_ms: 0,
-                                    error_count: 0,
-                                },
-                            );
-                        }
-                        Some(ToolUsageSummary {
-                            total_tool_calls: total_calls,
-                            unique_tool_count: by_tool.len() as u32,
-                            by_tool,
-                            total_tool_time_ms: 0,
-                            tool_error_count: 0,
-                        })
-                    } else {
-                        None
-                    };
-
-                    // Record StatsUpdated event async (spawn to avoid blocking)
-                    let store_for_stats = session_store.clone();
-                    let sid = session_id.clone();
-                    let rid = request_id.clone();
-                    let user_agent_for_stats = user_agent_clone.clone();
-                    tokio::spawn(async move {
-                        let event = lunaroute_session::SessionEvent::StatsUpdated {
-                            session_id: sid,
-                            request_id: rid,
-                            timestamp: chrono::Utc::now(),
-                            token_updates,
-                            tool_call_updates: tool_summary,
-                            model_used,
-                            response_size_bytes,
-                            content_blocks,
-                            has_refusal,
-                            user_agent: user_agent_for_stats,
-                        };
-                        if let Ok(json) = serde_json::to_value(event) {
-                            let _ = store_for_stats.write_event(None, json).await;
-                        }
-                    });
-
-                    tracing::debug!(
-                        "Async parsed Anthropic non-streaming response: tokens={}, tools={}",
-                        if has_tokens { "yes" } else { "no" },
-                        if has_tools { "yes" } else { "no" }
-                    );
-                }
-            });
-
-            if let Err(e) = futures::FutureExt::catch_unwind(parse_result).await {
-                tracing::error!(
-                    "Panic in async Anthropic non-streaming parser for session {}: {:?}",
-                    session_id_for_error,
-                    e
-                );
-            }
-        });
-    }
+    *axum_response.headers_mut() = forwardable_headers(&response_headers);
+    spawn_passthrough_response_recording(
+        &state,
+        &recording_session_id,
+        &recording_request_id,
+        (response_status, raw_response_bytes, response_headers),
+        (start_time, before_provider),
+        user_agent,
+    );
 
     Ok(axum_response)
 }

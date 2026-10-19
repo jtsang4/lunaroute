@@ -979,14 +979,7 @@ async fn test_anthropic_passthrough_non_streaming_with_recording() {
     assert_eq!(response_json["type"], "message");
     assert_eq!(response_json["content"][0]["text"], "Hello there!");
 
-    // Wait for async events to flush
-
-    // Wait longer to ensure async worker has time to flush
-    // Under heavy load (full test suite), the worker task may be delayed
-    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-    // Verify session events were recorded
-    let events = store.get_events();
+    let events = wait_for_stream_completion(&store).await;
 
     // Should have at least: Started, RequestRecorded, Completed (no StreamStarted for non-streaming)
     assert!(
@@ -1033,11 +1026,497 @@ async fn test_anthropic_passthrough_non_streaming_with_recording() {
         "Did not expect SessionEvent::StreamStarted for non-streaming request"
     );
 
-    // Verify Completed event (if present - may not always be recorded in time for non-streaming)
-    let completed_event = events
-        .iter()
-        .find(|e| matches!(e, SessionEvent::Completed { .. }));
-    if completed_event.is_none() {
-        eprintln!("Warning: SessionEvent::Completed not found for non-streaming request");
+    assert!(matches!(assert_single_completion(&events, true),
+        SessionEvent::Completed { finish_reason: Some(reason), final_stats, .. }
+        if reason == "end_turn" && final_stats.total_tokens.total_input == 10
+            && final_stats.total_tokens.total_output == 3));
+}
+
+fn raw_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .build()
+        .unwrap()
+}
+
+struct TestHttpServer {
+    url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestHttpServer {
+    async fn start(app: axum::Router) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self { url, task }
     }
+}
+
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn http_anthropic_proxy(
+    upstream: &str,
+    recording: bool,
+) -> (TestHttpServer, Arc<InMemorySessionStore>) {
+    let store = Arc::new(InMemorySessionStore::new());
+    let connector = Arc::new(
+        AnthropicConnector::new(AnthropicConfig::new("").with_base_url(upstream)).unwrap(),
+    );
+    let app = lunaroute_ingress::anthropic::passthrough_router(
+        connector,
+        None,
+        None,
+        recording.then(|| store.clone() as Arc<dyn lunaroute_core::session_store::SessionStore>),
+        15,
+        false,
+        None,
+    );
+    (TestHttpServer::start(app).await, store)
+}
+
+fn anthropic_http_request(stream: bool) -> serde_json::Value {
+    json!({
+        "model": "claude-test",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "Hello"}],
+        "stream": stream
+    })
+}
+
+fn assert_single_completion(events: &[SessionEvent], success: bool) -> &SessionEvent {
+    let completed: Vec<_> = events
+        .iter()
+        .filter(|event| matches!(event, SessionEvent::Completed { .. }))
+        .collect();
+    assert_eq!(completed.len(), 1, "one completion per request: {events:?}");
+    let SessionEvent::Completed {
+        request_id,
+        session_id,
+        success: actual,
+        ..
+    } = completed[0]
+    else {
+        unreachable!()
+    };
+    assert_eq!(*actual, success, "{events:?}");
+    assert!(events.iter().any(|event| matches!(event,
+        SessionEvent::Started { request_id: rid, session_id: sid, .. }
+        if rid == request_id && sid == session_id)));
+    completed[0]
+}
+
+#[tokio::test]
+async fn test_anthropic_chunked_responses_over_http() {
+    for (status, stream) in [(200, false), (401, false), (401, true)] {
+        for recording in [false, true] {
+            let body = if status == 200 {
+                json!({"model":"claude-test","content":[],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":2}})
+            } else {
+                json!({"type":"error","error":{"type":"authentication_error","message":"Invalid API key"}})
+            }.to_string();
+            let expected = body.clone();
+            let upstream = TestHttpServer::start(axum::Router::new().route(
+                "/v1/messages",
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    let body = body.clone();
+                    async move {
+                        assert!(!headers.contains_key("x-client-hop"));
+                        assert!(!headers.contains_key("x-client-other-hop"));
+                        assert!(!headers.contains_key("trailer"));
+                        let chunks = futures::stream::iter([
+                            Ok::<_, std::io::Error>(body[..10].to_string()),
+                            Ok(body[10..].to_string()),
+                        ]);
+                        let mut response = axum::http::Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .header("request-id", "req-upstream")
+                            .header("retry-after", "2")
+                            .header("set-cookie", "first=1")
+                            .header("set-cookie", "second=2")
+                            .header("connection", "keep-alive, X-Upstream-Hop")
+                            .header("x-upstream-hop", "private")
+                            .header("x-upstream-other-hop", "private")
+                            .header("keep-alive", "timeout=5")
+                            .header("trailer", "x-trailer")
+                            .body(Body::from_stream(chunks))
+                            .unwrap();
+                        response
+                            .headers_mut()
+                            .append("connection", "X-Upstream-Other-Hop".parse().unwrap());
+                        response
+                    }
+                }),
+            ))
+            .await;
+            let (proxy, store) = http_anthropic_proxy(&upstream.url, recording).await;
+            let response = raw_http_client()
+                .post(format!("{}/v1/messages", proxy.url))
+                .timeout(std::time::Duration::from_secs(5))
+                .header("connection", "X-Client-Hop")
+                .header("connection", "X-Client-Other-Hop")
+                .header("x-client-hop", "private")
+                .header("x-client-other-hop", "private")
+                .header("trailer", "x-trailer")
+                .json(&anthropic_http_request(stream))
+                .send()
+                .await
+                .expect("proxy must return a complete HTTP response");
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["request-id"], "req-upstream");
+            assert_eq!(response.headers()["retry-after"], "2");
+            assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+            for name in [
+                "connection",
+                "keep-alive",
+                "x-upstream-hop",
+                "x-upstream-other-hop",
+                "trailer",
+                "transfer-encoding",
+            ] {
+                assert!(!response.headers().contains_key(name), "leaked {name}");
+            }
+            assert_eq!(response.text().await.unwrap(), expected);
+            if recording {
+                let events = wait_for_stream_completion(&store).await;
+                let completion = assert_single_completion(&events, status == 200);
+                if status != 200 {
+                    let SessionEvent::Completed {
+                        error: Some(error), ..
+                    } = completion
+                    else {
+                        panic!("HTTP failure must be recorded");
+                    };
+                    assert!(error.contains("401"));
+                    assert!(error.contains("authentication_error"));
+                    assert!(error.contains("req-upstream"));
+                }
+            } else {
+                assert!(store.get_events().is_empty());
+            }
+        }
+    }
+}
+
+fn compress_anthropic_body(body: &[u8], encoding: &str) -> Vec<u8> {
+    use std::io::Write;
+    match encoding {
+        "identity" => body.to_vec(),
+        "gzip" => {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        }
+        "deflate" => {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(body).unwrap();
+            encoder.finish().unwrap()
+        }
+        "br" => {
+            let mut encoded = Vec::new();
+            {
+                let mut encoder = brotli::CompressorWriter::new(&mut encoded, 4096, 3, 22);
+                encoder.write_all(body).unwrap();
+            }
+            encoded
+        }
+        "zstd" => zstd::stream::encode_all(body, 1).unwrap(),
+        "gzip, br" => compress_anthropic_body(&compress_anthropic_body(body, "gzip"), "br"),
+        _ => panic!("unknown test encoding"),
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_compressed_response_recording_over_http() {
+    let body = json!({
+        "model":"claude-test", "stop_reason":"tool_use",
+        "content":[{"type":"tool_use","id":"toolu_http","name":"Read","input":{"file_path":"/tmp/test"}}],
+        "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":500,"cache_creation_input_tokens":20}
+    }).to_string();
+    for encoding in ["identity", "gzip", "deflate", "br", "zstd", "gzip, br"] {
+        let encoded = compress_anthropic_body(body.as_bytes(), encoding);
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .insert_header("content-encoding", encoding)
+                    .set_body_bytes(encoded.clone()),
+            )
+            .mount(&upstream)
+            .await;
+        let (proxy, store) = http_anthropic_proxy(&upstream.uri(), true).await;
+        let response = raw_http_client()
+            .post(format!("{}/v1/messages", proxy.url))
+            .header("accept-encoding", "gzip, deflate, br, zstd")
+            .json(&anthropic_http_request(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-encoding"], encoding);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), encoded.as_slice());
+        let events = wait_for_stream_completion(&store).await;
+        let completion = assert_single_completion(&events, true);
+        assert!(matches!(completion, SessionEvent::Completed {
+            finish_reason: Some(reason), final_stats, ..
+        } if reason == "tool_use" && final_stats.total_tokens.grand_total == 520
+            && final_stats.tool_summary.total_tool_calls == 1));
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::StatsUpdated { token_updates: Some(tokens), has_refusal: false, .. }
+            if tokens.total_cache_read == 500 && tokens.total_cache_creation == 20 && tokens.grand_total == 520)));
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEvent::ToolCallRecorded { tool_call_id, tool_arguments: Some(arguments), .. }
+            if tool_call_id == "toolu_http" && arguments == r#"{"file_path":"/tmp/test"}"#)));
+        assert_completion_persisted(&events, true).await;
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_response_parse_failures_complete_over_http() {
+    for (body, encoding) in [
+        (b"invalid JSON".to_vec(), "identity"),
+        (b"invalid gzip".to_vec(), "gzip"),
+        (b"{}".to_vec(), "unknown"),
+    ] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", encoding)
+                    .set_body_bytes(body.clone()),
+            )
+            .mount(&upstream)
+            .await;
+        let (proxy, store) = http_anthropic_proxy(&upstream.uri(), true).await;
+        let response = raw_http_client()
+            .post(format!("{}/v1/messages", proxy.url))
+            .json(&anthropic_http_request(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), body.as_slice());
+        let events = wait_for_stream_completion(&store).await;
+        assert!(matches!(assert_single_completion(&events, false),
+            SessionEvent::Completed { error: Some(error), .. } if error.contains("recording") && error.contains("200")));
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_transport_failures_complete_over_http() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    for stream in [false, true] {
+        let (proxy, store) = http_anthropic_proxy(&upstream, true).await;
+        let response = raw_http_client()
+            .post(format!("{}/v1/messages", proxy.url))
+            .json(&anthropic_http_request(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+        let events = wait_for_stream_completion(&store).await;
+        assert!(matches!(
+            assert_single_completion(&events, false),
+            SessionEvent::Completed { error: Some(_), .. }
+        ));
+    }
+}
+
+async fn assert_completion_persisted(events: &[SessionEvent], success: bool) {
+    use lunaroute_session::{sqlite_writer::SqliteWriter, writer::SessionWriter};
+    let directory = tempfile::tempdir().unwrap();
+    let writer = SqliteWriter::new(&directory.path().join("sessions.db"))
+        .await
+        .unwrap();
+    writer.write_batch(events).await.unwrap();
+    let sessions = writer.search_sessions(&Default::default()).await.unwrap();
+    assert_eq!(sessions.items.len(), 1);
+    assert!(sessions.items[0].completed_at.is_some());
+    assert_eq!(sessions.items[0].success, Some(success));
+    let SessionEvent::Completed { final_stats, .. } = assert_single_completion(events, success)
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        sessions.items[0].total_tokens as u64,
+        final_stats.total_tokens.grand_total
+    );
+}
+
+#[tokio::test]
+async fn test_anthropic_compressed_http_errors_complete_over_http() {
+    for stream in [false, true] {
+        for (status, encoding, body) in [
+            (
+                429,
+                "br",
+                json!({"type":"error","error":{"type":"rate_limit_error","message":"Retry later"}})
+                    .to_string(),
+            ),
+            (503, "gzip", "<html>Unavailable</html>".to_string()),
+        ] {
+            let encoded = compress_anthropic_body(body.as_bytes(), encoding);
+            let upstream = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("content-encoding", encoding)
+                        .insert_header("request-id", "req-error")
+                        .insert_header("retry-after", "10")
+                        .set_body_bytes(encoded.clone()),
+                )
+                .mount(&upstream)
+                .await;
+            let (proxy, store) = http_anthropic_proxy(&upstream.uri(), true).await;
+            let response = raw_http_client()
+                .post(format!("{}/v1/messages", proxy.url))
+                .json(&anthropic_http_request(stream))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["content-encoding"], encoding);
+            assert_eq!(response.headers()["retry-after"], "10");
+            assert_eq!(response.bytes().await.unwrap().as_ref(), encoded.as_slice());
+            let events = wait_for_stream_completion(&store).await;
+            let SessionEvent::Completed {
+                error: Some(error), ..
+            } = assert_single_completion(&events, false)
+            else {
+                panic!("missing error")
+            };
+            assert!(error.contains(&status.to_string()));
+            assert!(error.contains("req-error"));
+            if status == 429 {
+                assert!(error.contains("rate_limit_error"));
+            }
+            assert_completion_persisted(&events, false).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_sse_hop_headers_over_http() {
+    for recording in [false, true] {
+        let upstream = TestHttpServer::start(axum::Router::new().route("/v1/messages",
+            axum::routing::post(|headers: axum::http::HeaderMap| async move {
+                assert!(!headers.contains_key("accept-encoding"));
+                let sse = [
+                    json!({"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10}}}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
+                    json!({"type":"message_stop"}),
+                ].into_iter().map(sse_event).collect::<String>();
+                axum::http::Response::builder().header("content-type", "text/event-stream")
+                    .header("request-id", "req-sse").header("connection", "X-Upstream-Hop")
+                    .header("x-upstream-hop", "private").header("trailer", "x-trailer")
+                    .body(Body::from(sse)).unwrap()
+            }))).await;
+        let (proxy, store) = http_anthropic_proxy(&upstream.url, recording).await;
+        let response = raw_http_client()
+            .post(format!("{}/v1/messages", proxy.url))
+            .header("accept-encoding", "gzip, br")
+            .json(&anthropic_http_request(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["request-id"], "req-sse");
+        for name in [
+            "connection",
+            "x-upstream-hop",
+            "trailer",
+            "content-length",
+            "content-encoding",
+        ] {
+            assert!(!response.headers().contains_key(name), "leaked {name}");
+        }
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("event: message_stop")
+        );
+        if recording {
+            let events = wait_for_stream_completion(&store).await;
+            assert_single_completion(&events, true);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_truncated_http_bodies_complete() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for (status, stream) in [(200, false), (401, false), (401, true)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = TestHttpServer {
+            url: upstream_url,
+            task: tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 8192];
+                let received = socket.read(&mut request).await.unwrap();
+                assert!(received > 0);
+                let response = format!(
+                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{{"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }),
+        };
+        let (proxy, store) = http_anthropic_proxy(&upstream.url, true).await;
+        let response = raw_http_client()
+            .post(format!("{}/v1/messages", proxy.url))
+            .timeout(std::time::Duration::from_secs(5))
+            .json(&anthropic_http_request(stream))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 502);
+        let events = wait_for_stream_completion(&store).await;
+        assert_single_completion(&events, false);
+        assert_completion_persisted(&events, false).await;
+    }
+}
+
+#[tokio::test]
+async fn test_anthropic_recording_size_limit_preserves_http_body() {
+    let oversized = vec![b'a'; 32 * 1024 * 1024 + 1];
+    let body = compress_anthropic_body(&oversized, "gzip");
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-encoding", "gzip")
+                .set_body_bytes(body.clone()),
+        )
+        .mount(&upstream)
+        .await;
+    let (proxy, store) = http_anthropic_proxy(&upstream.uri(), true).await;
+    let response = raw_http_client()
+        .post(format!("{}/v1/messages", proxy.url))
+        .json(&anthropic_http_request(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), body.as_slice());
+    let events = wait_for_stream_completion(&store).await;
+    assert!(matches!(assert_single_completion(&events, false),
+        SessionEvent::Completed { error: Some(error), .. } if error.contains("recording limit")));
 }
