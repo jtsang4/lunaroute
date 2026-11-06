@@ -69,7 +69,9 @@ use lunaroute_egress::{
     anthropic::{AnthropicConfig, AnthropicConnector},
     openai::{OpenAIConfig, OpenAIConnector, RequestBodyModConfig, ResponseBodyModConfig},
 };
-use lunaroute_ingress::{BypassProvider, anthropic as anthropic_ingress, openai, with_bypass};
+use lunaroute_ingress::{
+    BypassProvider, anthropic as anthropic_ingress, openai, with_auto_bypass, with_bypass,
+};
 use lunaroute_observability::{HealthState, Metrics, health_router};
 use lunaroute_routing::{PathClassifier, RouteTable, Router, RoutingRule, RuleMatcher};
 use std::collections::HashMap;
@@ -1051,92 +1053,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Detect passthrough mode BEFORE creating router: dialect matches the only enabled provider
-    // This skips normalization for optimal performance and 100% API fidelity
-    let is_anthropic_passthrough = config.api_dialect == ApiDialect::Anthropic
-        && anthropic_connector.is_some()
-        && providers.len() == 1
-        && providers.contains_key("anthropic");
-
-    let is_openai_passthrough = config.api_dialect == ApiDialect::OpenAI
-        && openai_connector.is_some()
-        && providers.len() == 1
-        && providers.contains_key("openai");
-
-    // For dual-dialect mode, enable passthrough if BOTH connectors are available
-    // This allows OpenAI→OpenAI and Anthropic→Anthropic passthrough simultaneously
-    let is_dual_passthrough = config.api_dialect == ApiDialect::Both
-        && openai_connector.is_some()
-        && anthropic_connector.is_some();
-
-    let is_passthrough = is_anthropic_passthrough || is_openai_passthrough || is_dual_passthrough;
-
-    // Capture bypass provider info BEFORE connectors are moved
-    let bypass_provider_info = if config.bypass.enabled {
-        // Determine which provider to use for bypass
-        let provider_name = if let Some(name) = &config.bypass.provider {
-            Some(name.as_str())
-        } else if openai_connector.is_some() {
-            Some("openai")
-        } else if anthropic_connector.is_some() {
-            Some("anthropic")
-        } else {
-            None
-        };
-
-        match provider_name {
-            Some("openai") if openai_connector.is_some() => {
-                // Use base domain without /v1 path for bypass, since request paths
-                // already include the full path (e.g., /v1/embeddings)
-                let base_url = config
-                    .providers
-                    .openai
-                    .as_ref()
-                    .and_then(|p| p.base_url.clone())
-                    .unwrap_or_else(|| "https://api.openai.com".to_string());
-                // Strip trailing /v1 if present to avoid double-pathing (/v1/v1/...)
-                let base_url = base_url
-                    .trim_end_matches('/')
-                    .trim_end_matches("/v1")
-                    .to_string();
-                let api_key = config
-                    .providers
-                    .openai
-                    .as_ref()
-                    .and_then(|p| p.api_key.clone())
-                    .unwrap_or_default();
-
-                Some(("openai".to_string(), base_url, api_key))
-            }
-            Some("anthropic") if anthropic_connector.is_some() => {
-                // Use base domain without /v1 path for bypass, since request paths
-                // already include the full path (e.g., /v1/messages/count_tokens)
-                let base_url = config
-                    .providers
-                    .anthropic
-                    .as_ref()
-                    .and_then(|p| p.base_url.clone())
-                    .unwrap_or_else(|| "https://api.anthropic.com".to_string());
-                // Strip trailing /v1 if present to avoid double-pathing (/v1/v1/...)
-                let base_url = base_url
-                    .trim_end_matches('/')
-                    .trim_end_matches("/v1")
-                    .to_string();
-                let api_key = config
-                    .providers
-                    .anthropic
-                    .as_ref()
-                    .and_then(|p| p.api_key.clone())
-                    .unwrap_or_default();
-
-                Some(("anthropic".to_string(), base_url, api_key))
-            }
-            _ => None,
-        }
-    } else {
-        None
-    };
-
     // Initialize observability (needed before router creation)
     info!("📊 Initializing observability (metrics, health endpoints)");
     let metrics = Arc::new(Metrics::new()?);
@@ -1152,12 +1068,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(metrics.clone()),
         config.routing.provider_switch_notification.clone(),
     ));
-
-    if !is_passthrough {
-        info!("✓ Router created with health monitoring and circuit breakers");
-        info!("   Circuit breaker: 3 failures → open, 1 success → close");
-        info!("   Health monitor: tracks success rate and recent failures");
-    }
 
     if config.routing.provider_switch_notification.is_some() {
         info!("✓ Provider switch notifications enabled");
@@ -1175,130 +1085,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.session_stats_max_sessions.unwrap_or(100)
     );
 
-    // Create ingress router based on selected dialect
+    // Each protocol uses its native connector independently of other enabled providers.
+    let openai_router = if let Some(connector) = openai_connector {
+        openai::passthrough_router(
+            connector,
+            Some(stats_tracker_clone.clone()),
+            Some(metrics.clone()),
+            session_store_for_passthrough.clone(),
+            config.http_server.sse_keepalive_interval_secs,
+            config.http_server.sse_keepalive_enabled,
+            Some(provider_registry.clone()),
+        )
+    } else if let Some(store) = session_store_for_passthrough.clone() {
+        openai::router_with_session_store(router.clone(), store, "openai", "openai")
+    } else {
+        openai::router(router.clone())
+    };
+    let anthropic_router = if let Some(connector) = anthropic_connector {
+        anthropic_ingress::passthrough_router(
+            connector,
+            Some(stats_tracker_clone),
+            Some(metrics.clone()),
+            session_store_for_passthrough.clone(),
+            config.http_server.sse_keepalive_interval_secs,
+            config.http_server.sse_keepalive_enabled,
+            Some(provider_registry.clone()),
+        )
+    } else if let Some(store) = session_store_for_passthrough.clone() {
+        anthropic_ingress::router_with_session_store(
+            router.clone(),
+            store,
+            "anthropic",
+            "anthropic",
+        )
+    } else {
+        anthropic_ingress::router(router.clone())
+    };
     let api_router = match config.api_dialect {
-        ApiDialect::OpenAI => {
-            info!("📡 API dialect: OpenAI (/v1/chat/completions)");
-            if let (true, Some(connector)) = (is_openai_passthrough, openai_connector) {
-                info!("⚡ Passthrough mode: OpenAI→OpenAI (no normalization)");
-                openai::passthrough_router(
-                    connector,
-                    Some(stats_tracker_clone),
-                    Some(metrics.clone()),
-                    session_store_for_passthrough.clone(),
-                    config.http_server.sse_keepalive_interval_secs,
-                    config.http_server.sse_keepalive_enabled,
-                    Some(provider_registry.clone()),
-                )
-            } else if let Some(session_store) = session_store_for_passthrough.clone() {
-                openai::router_with_session_store(router, session_store, "openai", "openai")
-            } else {
-                openai::router(router)
-            }
-        }
-        ApiDialect::Anthropic => {
-            info!("📡 API dialect: Anthropic (/v1/messages)");
-            if is_anthropic_passthrough {
-                if let Some(connector) = anthropic_connector {
-                    info!("⚡ Passthrough mode: Anthropic→Anthropic (no normalization)");
-                    anthropic_ingress::passthrough_router(
-                        connector,
-                        Some(stats_tracker_clone),
-                        Some(metrics.clone()),
-                        session_store_for_passthrough.clone(),
-                        config.http_server.sse_keepalive_interval_secs,
-                        config.http_server.sse_keepalive_enabled,
-                        Some(provider_registry.clone()),
-                    )
-                } else {
-                    if let Some(session_store) = session_store_for_passthrough.clone() {
-                        anthropic_ingress::router_with_session_store(
-                            router,
-                            session_store,
-                            "anthropic",
-                            "anthropic",
-                        )
-                    } else {
-                        anthropic_ingress::router(router)
-                    }
-                }
-            } else if let Some(session_store) = session_store_for_passthrough.clone() {
-                anthropic_ingress::router_with_session_store(
-                    router,
-                    session_store,
-                    "anthropic",
-                    "anthropic",
-                )
-            } else {
-                anthropic_ingress::router(router)
-            }
-        }
-        ApiDialect::Both => {
-            info!("📡 API dialect: Both (OpenAI + Anthropic)");
-            info!("   - OpenAI format:   /v1/chat/completions");
-            info!("   - Anthropic format: /v1/messages");
-
-            if is_dual_passthrough {
-                info!(
-                    "⚡ Dual passthrough mode: OpenAI→OpenAI + Anthropic→Anthropic (no normalization)"
-                );
-                info!("   Routes determined by model prefix:");
-                info!("   - gpt-* models    → OpenAI provider (passthrough)");
-                info!("   - claude-* models → Anthropic provider (passthrough)");
-
-                lunaroute_ingress::multi_dialect::passthrough_router(
-                    openai_connector,
-                    anthropic_connector,
-                    Some(stats_tracker_clone),
-                    Some(metrics.clone()),
-                    session_store_for_passthrough.clone(),
-                    config.http_server.sse_keepalive_interval_secs,
-                    config.http_server.sse_keepalive_enabled,
-                    Some(provider_registry.clone()),
-                )
-            } else {
-                info!("🔄 Dual dialect with routing (normalization may occur)");
-                if let Some(session_store) = session_store_for_passthrough.clone() {
-                    lunaroute_ingress::multi_dialect::router_with_session_store(
-                        router,
-                        session_store,
-                    )
-                } else {
-                    lunaroute_ingress::multi_dialect::router(router)
-                }
-            }
-        }
+        ApiDialect::OpenAI => openai_router,
+        ApiDialect::Anthropic => anthropic_router,
+        ApiDialect::Both => openai_router.merge(anthropic_router),
     };
 
-    // Initialize bypass functionality (if enabled)
     let path_classifier = Arc::new(PathClassifier::new(config.bypass.enabled));
-
-    if config.bypass.enabled {
-        info!("🚀 Bypass enabled for unknown API paths");
-        info!(
-            "   Intercepted paths: /v1/chat/completions, /v1/messages, /v1/models, /healthz, /readyz, /metrics"
+    let api_router = if config.bypass.enabled {
+        // Raw bypass has no total response deadline, so active streams can keep running.
+        let client = Arc::new(
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .no_gzip()
+                .no_brotli()
+                .no_deflate()
+                .no_zstd()
+                .build()?,
         );
-        info!("   Bypassed paths: /v1/embeddings, /v1/audio/*, /v1/images/*, and others");
-    }
-
-    // Create bypass provider from captured info
-    let bypass_provider = bypass_provider_info.map(|(name, base_url, api_key)| {
-        info!("   Bypass provider: {} ({})", name, base_url);
-        Arc::new(BypassProvider::new(
-            base_url,
-            api_key,
-            name,
-            Arc::new(reqwest::Client::new()),
-            config.http_server.max_request_body_bytes,
-        ))
-    });
-
-    if config.bypass.enabled && bypass_provider.is_none() {
-        warn!("⚠️  Bypass enabled but no valid provider configured. Bypass will be disabled.");
-    }
-
-    // Wrap api_router with bypass functionality
-    let api_router = with_bypass(api_router, bypass_provider, path_classifier);
+        let bypass_provider =
+            |name: &str, settings: &Option<config::ProviderSettings>, default_url: &str| {
+                settings
+                    .as_ref()
+                    .filter(|settings| settings.enabled)
+                    .map(|settings| {
+                        let base_url = settings
+                            .base_url
+                            .as_deref()
+                            .unwrap_or(default_url)
+                            .trim_end_matches('/')
+                            .trim_end_matches("/v1")
+                            .to_string();
+                        Arc::new(BypassProvider::new(
+                            base_url,
+                            settings.api_key.clone().unwrap_or_default(),
+                            name.to_string(),
+                            client.clone(),
+                            config.http_server.max_request_body_bytes,
+                        ))
+                    })
+            };
+        let openai = bypass_provider("openai", &config.providers.openai, "https://api.openai.com");
+        let anthropic = bypass_provider(
+            "anthropic",
+            &config.providers.anthropic,
+            "https://api.anthropic.com",
+        );
+        match config.bypass.provider.as_deref() {
+            None => {
+                info!("🚀 Bypass routes each request by API path, provider headers, and model");
+                with_auto_bypass(api_router, openai, anthropic, path_classifier)
+            }
+            Some(name) => {
+                let provider = match name {
+                    "openai" => openai,
+                    "anthropic" => anthropic,
+                    _ => None,
+                }
+                .ok_or_else(|| anyhow::anyhow!("Bypass provider '{}' is not enabled", name))?;
+                info!("🚀 Bypass provider: {}", name);
+                with_bypass(api_router, Some(provider), path_classifier)
+            }
+        }
+    } else {
+        api_router
+    };
 
     // Create health/metrics router
     let health_router = health_router(health_state);

@@ -8,12 +8,14 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use lunaroute_routing::PathClassifier;
 use reqwest::Client;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
+
+use crate::ProviderType;
 
 /// Bypass proxy error
 #[derive(Debug, thiserror::Error)]
@@ -32,12 +34,23 @@ pub enum BypassError {
 
     #[error("No provider available for bypass")]
     NoProviderAvailable,
+
+    #[error(
+        "Cannot determine the upstream provider; include provider-specific headers or a model, or set bypass.provider"
+    )]
+    AmbiguousProvider,
+
+    #[error("Request path and credentials identify different upstream providers")]
+    ConflictingProvider,
 }
 
 impl IntoResponse for BypassError {
     fn into_response(self) -> Response {
         let status = match &self {
             BypassError::NoProviderAvailable => StatusCode::SERVICE_UNAVAILABLE,
+            BypassError::AmbiguousProvider | BypassError::ConflictingProvider => {
+                StatusCode::BAD_REQUEST
+            }
             _ => StatusCode::BAD_GATEWAY,
         };
 
@@ -116,6 +129,178 @@ pub fn with_bypass(
         let classifier = classifier_clone.clone();
         async move { bypass_handler_impl(provider, classifier, req).await }
     })
+}
+
+/// Route auxiliary requests by protocol, credentials, and model without changing their bodies.
+/// Shared model-list endpoints use the same selection as other bypass requests.
+pub fn with_auto_bypass(
+    router: Router,
+    openai: Option<Arc<BypassProvider>>,
+    anthropic: Option<Arc<BypassProvider>>,
+    classifier: Arc<PathClassifier>,
+) -> Router {
+    if !classifier.is_bypass_enabled() || (openai.is_none() && anthropic.is_none()) {
+        return router;
+    }
+
+    router
+        .fallback(|| async { StatusCode::NOT_FOUND })
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let openai = openai.clone();
+            let anthropic = anthropic.clone();
+            let classifier = classifier.clone();
+            async move {
+                let path = req.uri().path();
+                // Validate provider-specific credentials before forwarding native requests too.
+                let from_headers = match header_provider(req.headers()) {
+                    Ok(provider) => provider,
+                    Err(error) => return error.into_response(),
+                };
+                let from_path = path_provider(path);
+                if matches!((from_path, from_headers), (Some(a), Some(b)) if a != b) {
+                    return BypassError::ConflictingProvider.into_response();
+                }
+                let models =
+                    path == "/v1/models" && matches!(*req.method(), Method::GET | Method::HEAD);
+                if classifier.should_bypass(path) || models {
+                    match auto_bypass_request(openai, anthropic, req, from_path.or(from_headers))
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => error.into_response(),
+                    }
+                } else {
+                    next.run(req).await
+                }
+            }
+        }))
+}
+
+fn path_provider(path: &str) -> Option<ProviderType> {
+    let matches = |prefix: &&str| {
+        path == *prefix
+            || path
+                .strip_prefix(*prefix)
+                .is_some_and(|tail| tail.starts_with('/'))
+    };
+    if path == "/api/hello" || ["/v1/messages", "/v1/complete"].iter().any(matches) {
+        return Some(ProviderType::Anthropic);
+    }
+    [
+        "/v1/chat/completions",
+        "/v1/completions",
+        "/v1/responses",
+        "/responses",
+        "/v1/embeddings",
+        "/v1/audio",
+        "/v1/images",
+        "/v1/moderations",
+        "/v1/realtime",
+        "/v1/fine-tuning",
+        "/v1/assistants",
+        "/v1/threads",
+        "/v1/vector_stores",
+        "/v1/batches",
+        "/v1/uploads",
+    ]
+    .iter()
+    .any(matches)
+    .then_some(ProviderType::OpenAI)
+}
+
+fn header_provider(headers: &HeaderMap) -> Result<Option<ProviderType>, BypassError> {
+    let mut anthropic = headers.keys().any(|name| {
+        name.as_str().starts_with("anthropic-") || name.as_str().starts_with("x-claude-code-")
+    }) || headers.contains_key("x-api-key");
+    let mut openai = headers
+        .keys()
+        .any(|name| name.as_str().starts_with("openai-"))
+        || headers.contains_key("chatgpt-account-id");
+    for value in headers.get_all("authorization") {
+        if let Ok(value) = value.to_str()
+            && let Some((scheme, token)) = value.split_once(' ')
+            && scheme.eq_ignore_ascii_case("bearer")
+        {
+            if token.starts_with("sk-ant-") {
+                anthropic = true;
+            } else if token.starts_with("sk-") {
+                openai = true;
+            }
+        }
+    }
+    match (anthropic, openai) {
+        (true, true) => Err(BypassError::ConflictingProvider),
+        (true, false) => Ok(Some(ProviderType::Anthropic)),
+        (false, true) => Ok(Some(ProviderType::OpenAI)),
+        (false, false) => Ok(None),
+    }
+}
+
+async fn auto_bypass_request(
+    openai: Option<Arc<BypassProvider>>,
+    anthropic: Option<Arc<BypassProvider>>,
+    req: Request,
+    mut provider_type: Option<ProviderType>,
+) -> Result<Response, BypassError> {
+    let (parts, body) = req.into_parts();
+    let path = parts.uri.path();
+    // A known protocol must not fall back to a different provider when it is disabled.
+    let limit = match provider_type {
+        Some(ProviderType::OpenAI) => openai
+            .as_ref()
+            .map(|provider| provider.max_request_body_bytes),
+        Some(ProviderType::Anthropic) => anthropic
+            .as_ref()
+            .map(|provider| provider.max_request_body_bytes),
+        None => openai
+            .iter()
+            .chain(anthropic.iter())
+            .map(|provider| provider.max_request_body_bytes)
+            .max(),
+    }
+    .ok_or(BypassError::NoProviderAvailable)?;
+    let body = axum::body::to_bytes(body, limit)
+        .await
+        .map_err(|error| BypassError::BodyReadError(error.to_string()))?;
+
+    if provider_type.is_none()
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
+        && let Some(model) = json.get("model").and_then(|model| model.as_str())
+    {
+        provider_type = if model.starts_with("claude-") {
+            Some(ProviderType::Anthropic)
+        } else if model.starts_with("gpt-")
+            || model.starts_with("chatgpt-")
+            || model.starts_with("text-embedding-")
+            || ["o1", "o3", "o4"]
+                .iter()
+                .any(|prefix| model.starts_with(prefix))
+        {
+            Some(ProviderType::OpenAI)
+        } else {
+            None
+        };
+    }
+    let provider = match provider_type {
+        Some(ProviderType::OpenAI) => openai,
+        Some(ProviderType::Anthropic) => anthropic,
+        None => match (openai, anthropic) {
+            (Some(provider), None) | (None, Some(provider)) => Some(provider),
+            _ => return Err(BypassError::AmbiguousProvider),
+        },
+    }
+    .ok_or(BypassError::NoProviderAvailable)?;
+    if body.len() > provider.max_request_body_bytes {
+        return Err(BypassError::BodyReadError(
+            "Request body exceeds provider limit".into(),
+        ));
+    }
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|uri| uri.as_str())
+        .unwrap_or(path);
+    proxy_request(&provider, path, parts.method, parts.headers, body).await
 }
 
 /// Implementation of bypass handler
@@ -200,42 +385,25 @@ pub async fn proxy_request(
         method, path, url, provider.name
     );
 
-    // Convert HeaderMap to HashMap<String, String>, filtering hop-by-hop headers
-    let mut request_headers = HashMap::new();
+    let mut request_headers = forwardable_headers(&headers);
+    request_headers.remove("host");
 
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str();
-
-        // Skip hop-by-hop headers
-        if is_hop_by_hop_header(name_str) {
-            continue;
-        }
-
-        // Skip host header (will be set by reqwest)
-        if name_str.eq_ignore_ascii_case("host") {
-            continue;
-        }
-
-        // Get value as string
-        if let Ok(value_str) = value.to_str() {
-            request_headers.insert(name_str.to_string(), value_str.to_string());
-        } else {
-            warn!("Skipping header with non-UTF8 value: {}", name_str);
-        }
-    }
-
-    // Add/override Authorization header with provider API key only if configured.
-    // If no API key is configured, pass through the client's auth headers unchanged
-    // (needed for Claude Code passthrough where the client provides its own auth).
-    if !provider.api_key.is_empty() {
-        if provider.base_url.contains("anthropic.com") {
-            request_headers.insert("x-api-key".to_string(), provider.api_key.clone());
-            request_headers.insert("anthropic-version".to_string(), "2023-06-01".to_string());
-        } else {
-            // Default to OpenAI-style auth (Bearer token)
+    // Client credentials determine the account and billing mode. Server keys are fallbacks.
+    if !has_client_auth(&request_headers) && !provider.api_key.is_empty() {
+        if provider.name == "anthropic" || provider.base_url.contains("anthropic.com") {
             request_headers.insert(
-                "authorization".to_string(),
-                format!("Bearer {}", provider.api_key),
+                "x-api-key",
+                provider
+                    .api_key
+                    .parse()
+                    .map_err(|_| BypassError::InvalidHeaderValue("Configured API key".into()))?,
+            );
+        } else {
+            request_headers.insert(
+                "authorization",
+                format!("Bearer {}", provider.api_key)
+                    .parse()
+                    .map_err(|_| BypassError::InvalidHeaderValue("Configured API key".into()))?,
             );
         }
     }
@@ -246,10 +414,7 @@ pub async fn proxy_request(
         .request(method.clone(), &url)
         .body(body.to_vec());
 
-    // Add all headers
-    for (name, value) in request_headers {
-        req_builder = req_builder.header(name, value);
-    }
+    req_builder = req_builder.headers(request_headers);
 
     // Send request
     let response = req_builder.send().await?;
@@ -265,27 +430,50 @@ pub async fn proxy_request(
 
     debug!("Bypass proxy streaming response back, status: {}", status);
 
-    // Build response headers, filtering hop-by-hop headers
-    let mut response_header_map = HeaderMap::new();
-
-    for (name, value) in provider_headers.iter() {
-        let name_str = name.as_str();
-
-        // Skip hop-by-hop headers
-        if is_hop_by_hop_header(name_str) {
-            continue;
-        }
-
-        // Clone header to response
-        response_header_map.insert(name.clone(), value.clone());
-    }
-
     // Build axum response with a streaming body
     let mut response = Response::new(Body::from_stream(body_stream));
     *response.status_mut() = status;
-    *response.headers_mut() = response_header_map;
+    *response.headers_mut() = forwardable_headers(&provider_headers);
 
     Ok(response)
+}
+
+fn has_client_auth(headers: &HeaderMap) -> bool {
+    ["authorization", "x-api-key"].iter().any(|name| {
+        headers
+            .get_all(*name)
+            .iter()
+            .any(|value| !value.as_bytes().is_empty())
+    })
+}
+
+/// Preserve repeated end-to-end headers while rebuilding HTTP framing.
+pub(crate) fn forwardable_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = headers.clone();
+    for value in headers.get_all("connection") {
+        if let Ok(value) = value.to_str() {
+            for name in value.split(',') {
+                if let Ok(name) = axum::http::HeaderName::from_bytes(name.trim().as_bytes()) {
+                    forwarded.remove(name);
+                }
+            }
+        }
+    }
+    let names: Vec<_> = forwarded
+        .keys()
+        .filter(|name| {
+            is_hop_by_hop_header(name.as_str())
+                || matches!(
+                    name.as_str(),
+                    "content-length" | "trailer" | "proxy-connection"
+                )
+        })
+        .cloned()
+        .collect();
+    for name in names {
+        forwarded.remove(name);
+    }
+    forwarded
 }
 
 /// Check if a header is a hop-by-hop header that should not be forwarded

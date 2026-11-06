@@ -26,6 +26,65 @@ use lunaroute_session::events::{TokenTotals, ToolStats, ToolUsageSummary};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+pub(crate) type RawByteStream =
+    futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>;
+
+/// Copy a bounded portion of a response for observation without delaying its consumer.
+/// Byte and chunk budgets bound queued data; transport never waits for the observer.
+pub(crate) fn observe_bytes(
+    upstream: RawByteStream,
+) -> (
+    RawByteStream,
+    futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
+) {
+    const MAX_OBSERVED_BYTES: usize = 32 * 1024 * 1024;
+    const MAX_QUEUED_CHUNK_BYTES: usize = 256 * 1024;
+    const MAX_OBSERVED_CHUNKS: usize = 32_768;
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut sender = Some(sender);
+    let mut observed_bytes = 0usize;
+    let mut observed_chunks = 0usize;
+    let forwarded = upstream
+        .map(move |chunk| {
+            if let Some(tx) = sender.as_ref() {
+                let delivered = match &chunk {
+                    Ok(bytes) => {
+                        observed_bytes = observed_bytes.saturating_add(bytes.len());
+                        observed_bytes <= MAX_OBSERVED_BYTES
+                            && (0..bytes.len())
+                                .step_by(MAX_QUEUED_CHUNK_BYTES)
+                                .all(|start| {
+                                    let end = (start + MAX_QUEUED_CHUNK_BYTES).min(bytes.len());
+                                    observed_chunks += 1;
+                                    observed_chunks <= MAX_OBSERVED_CHUNKS
+                                        && tx
+                                            .send(Ok(bytes::Bytes::copy_from_slice(
+                                                &bytes[start..end],
+                                            )))
+                                            .is_ok()
+                                })
+                    }
+                    Err(error) => tx
+                        .send(Err(std::io::Error::other(error.to_string())))
+                        .is_ok(),
+                };
+                if !delivered {
+                    sender = None;
+                    tracing::warn!(
+                        "Response observer detached or reached its limit; forwarding continues"
+                    );
+                }
+            }
+            chunk
+        })
+        .boxed();
+    let observed = futures::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|chunk| (chunk, receiver))
+    })
+    .boxed();
+    (forwarded, observed)
+}
+
 /// Information about a tool call extracted from stream
 #[derive(Debug, Clone)]
 pub struct ToolCallInfo {
@@ -630,6 +689,36 @@ pub fn spawn_openai_parser<E>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn forwarding_outlives_a_failed_or_lagging_observer() {
+        use futures::StreamExt;
+        for failed in [true, false] {
+            let source = futures::stream::iter(
+                (0..33_000).map(|_| Ok::<_, reqwest::Error>(bytes::Bytes::from_static(b"x"))),
+            )
+            .boxed();
+            let (mut forwarded, observed) = super::observe_bytes(source);
+            let mut observed = Some(observed);
+            if failed {
+                observed = None;
+            }
+            let count = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                let mut count = 0;
+                while let Some(chunk) = forwarded.next().await {
+                    assert_eq!(chunk.unwrap(), b"x".as_slice());
+                    count += 1;
+                }
+                count
+            })
+            .await
+            .expect("forwarding cannot wait for the observer");
+            assert_eq!(count, 33_000);
+            if let Some(observed) = observed {
+                assert_eq!(observed.collect::<Vec<_>>().await.len(), 32_768);
+            }
+        }
+    }
+
     use super::*;
     use futures::stream;
 

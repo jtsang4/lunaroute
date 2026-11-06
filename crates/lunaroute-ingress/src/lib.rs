@@ -18,7 +18,7 @@ pub mod responses_ws;
 pub mod streaming_metrics;
 pub mod types;
 
-pub use bypass::{BypassError, BypassProvider, proxy_request, with_bypass};
+pub use bypass::{BypassError, BypassProvider, proxy_request, with_auto_bypass, with_bypass};
 pub use middleware::CorsConfig;
 pub use provider_registry::{ProviderEntry, ProviderRegistry, ProviderType};
 pub use responses_ws::responses_ws_handler;

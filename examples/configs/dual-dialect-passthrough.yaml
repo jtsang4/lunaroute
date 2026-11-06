@@ -89,7 +89,7 @@ providers:
     # Optional: HTTP client configuration for connection pooling
     # Uncomment to customize timeouts (uses sensible defaults if not specified)
     # http_client:
-    #   # Request timeout - how long to wait for entire request (including streaming)
+    #   # Read-idle timeout - reset whenever upstream bytes arrive
     #   timeout_secs: 600              # Default: 600s (10 min)
     #
     #   # Connection timeout - how long to wait when establishing connection

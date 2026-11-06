@@ -174,7 +174,7 @@ pub struct ProviderSettings {
 /// HTTP client configuration settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpClientSettings {
-    /// Request timeout in seconds (default: 600 for OpenAI, 600 for Anthropic)
+    /// Read-idle timeout in seconds (default: 600); active streams have no total deadline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 
@@ -399,8 +399,8 @@ pub struct BypassConfig {
     #[serde(default = "default_bypass_enabled")]
     pub enabled: bool,
 
-    /// Provider to use for bypassed requests (default: None = first available)
-    /// If not specified, uses the first available provider
+    /// Optional fixed provider for bypassed requests.
+    /// When omitted, infer the provider from each request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 }

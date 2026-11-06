@@ -32,6 +32,22 @@ fn redact_header_line(name: &str, value: &str) -> String {
     }
 }
 
+fn to_header_map(
+    headers: std::collections::HashMap<String, String>,
+) -> Result<reqwest::header::HeaderMap> {
+    reqwest::header::HeaderMap::try_from(&headers)
+        .map_err(|error| EgressError::ConfigError(error.to_string()))
+}
+
+fn has_client_auth(headers: &reqwest::header::HeaderMap) -> bool {
+    ["authorization", "x-api-key"].iter().any(|name| {
+        headers
+            .get_all(*name)
+            .iter()
+            .any(|value| !value.as_bytes().is_empty())
+    })
+}
+
 /// Anthropic connector configuration
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -98,6 +114,21 @@ impl AnthropicConnector {
         url
     }
 
+    /// Forward the caller's bytes and headers without interpreting the API body.
+    pub async fn passthrough_response(
+        &self,
+        body: bytes::Bytes,
+        headers: reqwest::header::HeaderMap,
+        query: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let client_auth = has_client_auth(&headers);
+        let mut request = self.client.post(self.messages_url(query)).headers(headers);
+        if !client_auth && !self.config.api_key.is_empty() {
+            request = request.header("x-api-key", &self.config.api_key);
+        }
+        Ok(request.body(body).send().await?)
+    }
+
     /// Send a raw JSON request directly to Anthropic (passthrough mode)
     /// Returns the raw response status, bytes and headers for true transparent proxying.
     /// Error responses (non-2xx) are passed through unchanged - the client handles them.
@@ -107,7 +138,7 @@ impl AnthropicConnector {
         request_json: serde_json::Value,
         headers: std::collections::HashMap<String, String>,
     ) -> Result<(u16, bytes::Bytes, reqwest::header::HeaderMap)> {
-        self.send_passthrough_with_query(request_json, headers, None)
+        self.send_passthrough_with_query(request_json, to_header_map(headers)?, None)
             .await
     }
 
@@ -116,7 +147,7 @@ impl AnthropicConnector {
     pub async fn send_passthrough_with_query(
         &self,
         request_json: serde_json::Value,
-        headers: std::collections::HashMap<String, String>,
+        headers: reqwest::header::HeaderMap,
         query: Option<&str>,
     ) -> Result<(u16, bytes::Bytes, reqwest::header::HeaderMap)> {
         debug!("Sending passthrough request to Anthropic (no normalization)");
@@ -127,7 +158,10 @@ impl AnthropicConnector {
         debug!("├─────────────────────────────────────────────────────────");
         debug!("│ x-api-key: <api_key>");
         for (name, value) in &headers {
-            debug!("{}", redact_header_line(name.as_str(), value.as_str()));
+            debug!(
+                "{}",
+                redact_header_line(name.as_str(), value.to_str().unwrap_or("<binary>"))
+            );
         }
         debug!("│ Content-Type: application/json");
         debug!("├─────────────────────────────────────────────────────────");
@@ -149,26 +183,10 @@ impl AnthropicConnector {
             .post(self.messages_url(query))
             .header("Content-Type", "application/json");
 
-        // If we have a configured API key, filter out client auth headers and use our key
-        // If not, pass through all headers including client's auth
-        if !config_api_key.is_empty() {
-            // Add all headers except authorization headers
-            for (name, value) in &headers {
-                let name_lower = name.to_lowercase();
-                if name_lower != "authorization" && name_lower != "x-api-key" {
-                    request_builder = request_builder.header(name, value);
-                } else {
-                    debug!("│ [FILTERED] {}: <removed>", name);
-                }
-            }
-            // Use configured API key
+        let has_client_auth = has_client_auth(&headers);
+        request_builder = request_builder.headers(headers);
+        if !has_client_auth && !config_api_key.is_empty() {
             request_builder = request_builder.header("x-api-key", &config_api_key);
-            debug!("│ [OVERRIDE] x-api-key: <configured_api_key>");
-        } else {
-            // No configured API key, pass through all headers
-            for (name, value) in &headers {
-                request_builder = request_builder.header(name, value);
-            }
         }
 
         debug!("├─────────────────────────────────────────────────────────");
@@ -233,7 +251,7 @@ impl AnthropicConnector {
         request_json: serde_json::Value,
         headers: std::collections::HashMap<String, String>,
     ) -> Result<reqwest::Response> {
-        self.stream_passthrough_with_query(request_json, headers, None)
+        self.stream_passthrough_with_query(request_json, to_header_map(headers)?, None)
             .await
     }
 
@@ -242,7 +260,7 @@ impl AnthropicConnector {
     pub async fn stream_passthrough_with_query(
         &self,
         request_json: serde_json::Value,
-        headers: std::collections::HashMap<String, String>,
+        headers: reqwest::header::HeaderMap,
         query: Option<&str>,
     ) -> Result<reqwest::Response> {
         debug!("Sending passthrough streaming request to Anthropic (no normalization)");
@@ -253,7 +271,10 @@ impl AnthropicConnector {
         debug!("├─────────────────────────────────────────────────────────");
         debug!("│ x-api-key: <api_key>");
         for (name, value) in &headers {
-            debug!("{}", redact_header_line(name.as_str(), value.as_str()));
+            debug!(
+                "{}",
+                redact_header_line(name.as_str(), value.to_str().unwrap_or("<binary>"))
+            );
         }
         debug!("│ Content-Type: application/json");
         debug!("├─────────────────────────────────────────────────────────");
@@ -271,45 +292,13 @@ impl AnthropicConnector {
             .post(self.messages_url(query))
             .header("Content-Type", "application/json");
 
-        // If we have a configured API key, filter out client auth headers and use our key
-        // If not, pass through all headers including client's auth
-        //
-        // IMPORTANT: Always strip `accept-encoding` for streaming requests.
-        // The SSE event parser needs uncompressed text. If the client sends
-        // `accept-encoding: gzip`, Anthropic responds with a gzip-compressed
-        // SSE stream that the eventsource parser cannot read, causing the
-        // stream to hang indefinitely.
-        if !self.config.api_key.is_empty() {
-            // Add all headers except authorization and encoding headers
-            for (name, value) in &headers {
-                let name_lower = name.to_lowercase();
-                if name_lower == "authorization" || name_lower == "x-api-key" {
-                    debug!("│ [FILTERED] {}: <removed>", name);
-                } else if name_lower == "accept-encoding" {
-                    debug!(
-                        "│ [FILTERED] {}: {} (streaming requires uncompressed SSE)",
-                        name, value
-                    );
-                } else {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
-            // Use configured API key
+        let has_client_auth = has_client_auth(&headers);
+        // The SSE parser reads uncompressed events; preserve all other client headers.
+        let mut headers = headers;
+        headers.remove("accept-encoding");
+        request_builder = request_builder.headers(headers);
+        if !has_client_auth && !self.config.api_key.is_empty() {
             request_builder = request_builder.header("x-api-key", &self.config.api_key);
-            debug!("│ [OVERRIDE] x-api-key: <configured_api_key>");
-        } else {
-            // No configured API key, pass through all headers (except accept-encoding)
-            for (name, value) in &headers {
-                let name_lower = name.to_lowercase();
-                if name_lower == "accept-encoding" {
-                    debug!(
-                        "│ [FILTERED] {}: {} (streaming requires uncompressed SSE)",
-                        name, value
-                    );
-                } else {
-                    request_builder = request_builder.header(name, value);
-                }
-            }
         }
 
         debug!("├─────────────────────────────────────────────────────────");

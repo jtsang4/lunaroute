@@ -55,9 +55,11 @@ export OPENAI_BASE_URL=http://localhost:8081/v1  # For Codex CLI
 **That's it.** No API keys to configure, no YAML files to write, nothing. LunaRoute automatically:
 - ✅ Accepts **both** OpenAI and Anthropic formats simultaneously
 - ⚡ Runs in **dual passthrough mode** (zero normalization overhead)
-- 🔑 Uses your existing API keys (from env vars or client headers)
+- 🔑 Preserves client authentication, including Claude subscription OAuth; configured keys are fallbacks
 - 📊 Tracks every token, tool call, and conversation
-- 🎯 Routes requests based on model prefix (`gpt-*` → OpenAI, `claude-*` → Anthropic)
+- 🎯 Selects the upstream from the API path, provider headers, and model without switching modes
+
+Claude `/v1/messages` requests and OpenAI chat/Responses requests use their native passthrough handlers. Native HTTP forwarding preserves request and response bytes, including unknown fields, headers, SSE events, and compressed content. Statistics read a bounded copy independently; unsupported content or observation failures leave forwarding intact. Bypass routes auxiliary requests individually, including Claude token counting and each provider's model and file endpoints. Shared endpoints use provider-specific headers or the model; requests with conflicting or insufficient information return an error before any credentials are forwarded. Custom upstream addresses can still be set in provider configuration.
 
 ---
 
@@ -196,10 +198,8 @@ export OPENAI_BASE_URL=http://localhost:8081/v1
 ✓ OpenAI provider enabled (no API key - will use client auth)
 ✓ Anthropic provider enabled (no API key - will use client auth)
 📡 API dialect: Both (OpenAI + Anthropic)
-⚡ Dual passthrough mode: OpenAI→OpenAI + Anthropic→Anthropic (no normalization)
-   - gpt-* models    → OpenAI provider (passthrough)
-   - claude-* models → Anthropic provider (passthrough)
-🚀 Bypass enabled for unknown API paths
+⚡ Native passthrough for OpenAI and Anthropic requests
+🚀 Bypass routes each request by API path, provider headers, and model
 📊 Session recording enabled (SQLite + JSONL)
 🎨 Web UI available at http://localhost:8082
 ```

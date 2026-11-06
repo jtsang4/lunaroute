@@ -8,9 +8,7 @@ use tracing::{debug, warn};
 /// HTTP client configuration
 #[derive(Debug, Clone)]
 pub struct HttpClientConfig {
-    /// Request timeout in seconds
-    /// Note: This applies to the entire request including streaming responses.
-    /// Set high enough to accommodate long-running operations like extended thinking.
+    /// Read-idle timeout in seconds, reset whenever upstream data arrives.
     pub timeout_secs: u64,
 
     /// Connection timeout in seconds
@@ -42,21 +40,7 @@ pub struct HttpClientConfig {
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
-            // IMPORTANT: Timeout increased from 60s to 600s (10 minutes)
-            //
-            // This timeout applies to the ENTIRE request, including streaming responses.
-            // For streaming requests (especially with extended thinking), the request
-            // can remain open for several minutes as chunks are generated.
-            //
-            // Without this increase:
-            // - Extended thinking sessions timeout mid-stream
-            // - Claude Code compaction operations fail
-            // - Connections get stuck in inconsistent state in the pool
-            //
-            // 600s (10 min) accommodates:
-            // - Extended thinking/reasoning (can take 3-5+ minutes)
-            // - Long streaming responses with pauses
-            // - Complex code generation operations
+            // Active streams can continue for any duration; stalled reads time out.
             timeout_secs: 600,
             connect_timeout_secs: 10,
             pool_max_idle_per_host: 32,
@@ -101,8 +85,9 @@ pub fn create_client(config: &HttpClientConfig) -> Result<Client> {
     );
 
     ClientBuilder::new()
-        .timeout(Duration::from_secs(config.timeout_secs))
+        .read_timeout(Duration::from_secs(config.timeout_secs))
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+        .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(config.pool_max_idle_per_host)
         // CRITICAL FIX: Expire idle connections before upstream servers close them
         // Without this, connections sit in pool forever and get closed by server,

@@ -16,7 +16,7 @@ providers:
 # Bypass configuration (optional - defaults shown)
 # bypass:
 #   enabled: true          # Default: true - bypass is ON by default
-#   provider: "openai"     # Default: null (uses first available provider)
+#   provider: "openai"     # Optional fixed provider; omitted = infer per request
 
 # With bypass enabled (default):
 # - Intercepted paths use routing: /v1/chat/completions, /v1/messages, /v1/models

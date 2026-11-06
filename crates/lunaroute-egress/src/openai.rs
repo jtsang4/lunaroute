@@ -333,10 +333,46 @@ impl OpenAIConnector {
         None
     }
 
-    /// Check if proxy has a configured API key that should override client auth
-    /// (Note: Codex auth is a fallback, not an override - client auth takes precedence)
-    fn has_override_auth(&self) -> bool {
-        !self.config.api_key.is_empty()
+    /// Forward an HTTP request without validating the upstream response schema or status.
+    pub async fn passthrough_response(
+        &self,
+        endpoint: &str,
+        body: bytes::Bytes,
+        mut headers: reqwest::header::HeaderMap,
+        query: Option<&str>,
+    ) -> Result<reqwest::Response> {
+        let client_auth = headers
+            .get_all("authorization")
+            .iter()
+            .any(|value| !value.as_bytes().is_empty());
+        let client_account = headers.contains_key("chatgpt-account-id");
+        if self.should_override_account_id() {
+            headers.remove("chatgpt-account-id");
+        }
+        if self.uses_codex_auth() {
+            headers.remove("user-agent");
+            headers.remove("originator");
+        }
+        let mut url = format!("{}/{}", self.config.base_url, endpoint);
+        if let Some(query) = query {
+            url.push('?');
+            url.push_str(query);
+        }
+        let mut request = self.client.post(url).headers(headers);
+        if !client_auth && let Some(auth) = self.get_fallback_auth_header() {
+            request = request.header("authorization", auth);
+        }
+        if (!client_account || self.should_override_account_id())
+            && let Some(account) = self.get_codex_account_id()
+        {
+            request = request.header("chatgpt-account-id", account);
+        }
+        if self.uses_codex_auth() {
+            request = request
+                .header("user-agent", crate::codex_headers::codex_user_agent())
+                .header("originator", crate::codex_headers::CODEX_ORIGINATOR);
+        }
+        Ok(request.body(body).send().await?)
     }
 
     /// Send a raw JSON request directly to OpenAI (passthrough mode)
@@ -409,23 +445,17 @@ impl OpenAIConnector {
                     .client
                     .post(format!("{}/{}", config.base_url, endpoint));
 
-                // Check if we have configured API key that should override client auth
-                let has_override_auth = self.has_override_auth();
                 let should_override_account_id = self.should_override_account_id();
                 let uses_codex_auth = self.uses_codex_auth();
                 let mut client_provided_auth = false;
 
-                // Forward headers from client, skipping only if configured API key should override
+                // Preserve client authentication; server credentials are fallbacks
                 for (name, value) in &headers {
                     let name_lower = name.to_lowercase();
 
                     // Track if client provided authorization
                     if name_lower == "authorization" {
                         client_provided_auth = true;
-                        if has_override_auth {
-                            debug!("Skipping client Authorization header (configured API key will override)");
-                            continue;
-                        }
                     }
 
                     // Skip client's chatgpt-account-id header if we have configured account_id
@@ -511,23 +541,17 @@ impl OpenAIConnector {
                     .client
                     .post(format!("{}/{}", config.base_url, endpoint));
 
-                // Check if we have configured API key that should override client auth
-                let has_override_auth = self.has_override_auth();
                 let should_override_account_id = self.should_override_account_id();
                 let uses_codex_auth = self.uses_codex_auth();
                 let mut client_provided_auth = false;
 
-                // Forward headers from client, skipping only if configured API key should override
+                // Preserve client authentication; server credentials are fallbacks
                 for (name, value) in &headers {
                     let name_lower = name.to_lowercase();
 
                     // Track if client provided authorization
                     if name_lower == "authorization" {
                         client_provided_auth = true;
-                        if has_override_auth {
-                            debug!("Skipping client Authorization header (configured API key will override)");
-                            continue;
-                        }
                     }
 
                     // Skip client's chatgpt-account-id header if we have configured account_id
@@ -673,25 +697,17 @@ impl OpenAIConnector {
             .client
             .post(format!("{}/{}", self.config.base_url, endpoint));
 
-        // Check if we have configured API key that should override client auth
-        let has_override_auth = self.has_override_auth();
         let should_override_account_id = self.should_override_account_id();
         let uses_codex_auth = self.uses_codex_auth();
         let mut client_provided_auth = false;
 
-        // Forward headers from client, skipping only if configured API key should override
+        // Preserve client authentication; server credentials are fallbacks
         for (name, value) in &headers {
             let name_lower = name.to_lowercase();
 
             // Track if client provided authorization
             if name_lower == "authorization" {
                 client_provided_auth = true;
-                if has_override_auth {
-                    debug!(
-                        "Skipping client Authorization header (configured API key will override)"
-                    );
-                    continue;
-                }
             }
 
             // Skip client's chatgpt-account-id header if we have configured account_id
@@ -778,25 +794,17 @@ impl OpenAIConnector {
             .client
             .get(format!("{}/{}", self.config.base_url, endpoint));
 
-        // Check if we have configured API key that should override client auth
-        let has_override_auth = self.has_override_auth();
         let should_override_account_id = self.should_override_account_id();
         let uses_codex_auth = self.uses_codex_auth();
         let mut client_provided_auth = false;
 
-        // Forward headers from client, skipping only if configured API key should override
+        // Preserve client authentication; server credentials are fallbacks
         for (name, value) in &headers {
             let name_lower = name.to_lowercase();
 
             // Track if client provided authorization
             if name_lower == "authorization" {
                 client_provided_auth = true;
-                if has_override_auth {
-                    debug!(
-                        "Skipping client Authorization header (configured API key will override)"
-                    );
-                    continue;
-                }
             }
 
             // Skip client's chatgpt-account-id header if we have configured account_id
@@ -868,26 +876,17 @@ impl OpenAIConnector {
             .client
             .post(format!("{}/{}", self.config.base_url, endpoint));
 
-        // Check if we have configured API key that should override client auth
-        let has_override_auth = self.has_override_auth();
         let should_override_account_id = self.should_override_account_id();
         let uses_codex_auth = self.uses_codex_auth();
         let mut client_provided_auth = false;
 
-        // Forward headers from client, skipping only if configured API key should override
+        // Preserve client authentication; server credentials are fallbacks
         for (name, value) in &headers {
             let name_lower = name.to_lowercase();
 
             // Track if client provided authorization
             if name_lower == "authorization" {
                 client_provided_auth = true;
-                if has_override_auth {
-                    debug!(
-                        "Skipping client Authorization header (configured API key will override): {} chars",
-                        value.len()
-                    );
-                    continue;
-                }
             }
 
             // Skip client's chatgpt-account-id header if we have configured account_id

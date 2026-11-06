@@ -35,12 +35,12 @@ lunaroute-server
 # 2. Point Claude Code to the proxy
 export ANTHROPIC_BASE_URL=http://localhost:8081
 
-# 3. Use Claude Code normally - it will send its API key automatically!
+# 3. Use Claude Code normally with your subscription login or API key
 ```
 
-**That's it!** All requests flow through LunaRoute with <0.2ms overhead. Your API key stays in Claude Code only.
+**That's it!** LunaRoute forwards Claude Code's authentication to Anthropic. A subscription login uses OAuth Bearer authentication; API-key authentication uses `x-api-key`.
 
-> **Why no API key?** In passthrough mode, LunaRoute forwards Claude Code's `x-api-key` header directly to Anthropic. This means:
+> **Why no server-side API key?** Passthrough preserves Claude Code's authentication and beta headers. Configured server keys are used only when the request has no authentication. This means:
 > - ✅ Zero configuration needed
 > - ✅ API key never stored on proxy server
 > - ✅ Multiple developers can use same proxy with different keys
@@ -91,7 +91,7 @@ lunaroute-server --config examples/configs/dual-dialect-passthrough.yaml
 # And also: export OPENAI_BASE_URL=http://localhost:8081
 ```
 
-**📝 Note:** All example configs use client authentication by default (no `api_key` field). If you want server-side keys, add `api_key: "${ANTHROPIC_API_KEY}"` to the config.
+**📝 Note:** No dialect or bypass-provider setting is needed for normal Claude Code use. Both protocols are enabled by default, and Claude auxiliary requests such as `/v1/messages/count_tokens` are routed to Anthropic. An optional `api_key: "${ANTHROPIC_API_KEY}"` supplies credentials for requests without client authentication.
 
 ---
 
@@ -99,7 +99,7 @@ lunaroute-server --config examples/configs/dual-dialect-passthrough.yaml
 
 ### 1. **Zero-Overhead Passthrough Mode**
 
-When your API dialect matches the provider (Anthropic→Anthropic), LunaRoute skips normalization entirely:
+When an Anthropic connector is enabled, Anthropic requests use passthrough independently of the other enabled providers:
 
 - **Sub-millisecond overhead**: ~0.1-0.2ms added latency
 - **100% API fidelity**: Preserves extended thinking, all response fields
@@ -109,11 +109,11 @@ When your API dialect matches the provider (Anthropic→Anthropic), LunaRoute sk
 **How it works:**
 ```yaml
 # claude-code-proxy.yaml
-api_dialect: "anthropic"  # Match your provider
+# Both API formats are accepted by default.
 providers:
   anthropic:
     enabled: true
-    # No api_key = forwards client's header
+    # Client OAuth or API-key authentication is forwarded unchanged.
 ```
 
 ### 2. **Client Authorization Forwarding**

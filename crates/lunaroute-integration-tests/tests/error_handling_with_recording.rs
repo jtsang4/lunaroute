@@ -87,8 +87,12 @@ async fn test_openai_400_error_with_recording() {
         .await
         .unwrap();
 
-    // Verify error response (upstream errors become 502 Bad Gateway)
-    assert_eq!(response.status(), 502);
+    assert_eq!(response.status(), 400);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
 
     // Wait for async events to flush
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -117,10 +121,7 @@ async fn test_openai_400_error_with_recording() {
             || matches!(e, SessionEvent::Completed { error: Some(_), .. })
     });
 
-    if !error_recorded {
-        eprintln!("Warning: Expected error event to be recorded for 400 status");
-        eprintln!("Events captured: {:?}", events);
-    }
+    assert!(error_recorded, "400 response must be recorded as a failure");
 }
 
 #[tokio::test]
@@ -139,7 +140,7 @@ async fn test_openai_500_error_with_recording() {
                 "code": null
             }
         })))
-        .expect(1..)
+        .expect(1)
         .mount(&mock_server)
         .await;
 
@@ -190,8 +191,12 @@ async fn test_openai_500_error_with_recording() {
         .await
         .unwrap();
 
-    // Verify error response (upstream errors become 502 Bad Gateway)
-    assert_eq!(response.status(), 502);
+    assert_eq!(response.status(), 500);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["type"], "server_error");
 
     // Wait for async events to flush
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -220,10 +225,7 @@ async fn test_openai_500_error_with_recording() {
             || matches!(e, SessionEvent::Completed { error: Some(_), .. })
     });
 
-    if !error_recorded {
-        eprintln!("Warning: Expected error to be recorded in Completed event for 500 status");
-        eprintln!("Events captured: {:?}", events);
-    }
+    assert!(error_recorded, "500 response must be recorded as a failure");
 }
 
 #[tokio::test]
@@ -477,8 +479,12 @@ async fn test_openai_streaming_error_with_recording() {
         .await
         .unwrap();
 
-    // Verify error response (upstream errors become 502 Bad Gateway)
-    assert_eq!(response.status(), 502);
+    assert_eq!(response.status(), 400);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
 
     // Wait for async events to flush
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -516,8 +522,8 @@ async fn test_openai_streaming_error_with_recording() {
             || matches!(e, SessionEvent::Completed { error: Some(_), .. })
     });
 
-    if !error_recorded {
-        eprintln!("Warning: Expected error event to be recorded for streaming error");
-        eprintln!("Events captured: {:?}", events);
-    }
+    assert!(
+        error_recorded,
+        "HTTP stream errors must be recorded as failures"
+    );
 }

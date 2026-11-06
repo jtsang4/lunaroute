@@ -1,9 +1,12 @@
 //! OpenAI ingress adapter
 
-use crate::types::{IngressError, IngressResult};
+use crate::{
+    bypass::forwardable_headers,
+    types::{IngressError, IngressResult},
+};
 use axum::{
     Router,
-    extract::{Json, State},
+    extract::{Json, RawQuery, State},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -32,11 +35,8 @@ const MAX_TOOL_ARGS_SIZE: usize = 1_000_000;
 /// Maximum number of SSE events to collect for async parsing (prevents OOM on very long streams)
 const MAX_COLLECTED_EVENTS: usize = 10_000;
 
-/// A single SSE event yielded by the shared responses pipeline.
-///
-/// Both the HTTP handler (which re-wraps in `axum::response::sse::Event`)
-/// and the WebSocket handler (which sends the `data` payload as a text frame)
-/// consume this.
+/// SSE data consumed by the Responses WebSocket bridge and HTTP observations.
+/// Native HTTP forwarding carries the original response bytes independently.
 #[derive(Debug, Clone)]
 pub(crate) struct SseEvent {
     pub event: String,
@@ -910,20 +910,31 @@ struct ModelObject {
     owned_by: String,
 }
 
-/// Drive the upstream `/responses` streaming pipeline and return a stream of
-/// SSE events. Shared by HTTP `responses_passthrough` and the WebSocket
-/// handler in `crate::responses_ws`.
-///
-/// Performs: header filtering, LUNAROUTE marker detection, session recording
-/// (Started / RequestRecorded / StatsUpdated / ToolCallRecorded / Completed),
-/// upstream call via `OpenAIConnector::stream_passthrough_to_endpoint_bytes`,
-/// SSE parsing, and metric extraction. Identical side effects to the original
-/// streaming branch — just no axum wrapping.
+/// Decode Responses SSE events for the WebSocket bridge and session observations.
+/// HTTP clients receive the upstream bytes through an independent stream.
 pub(crate) async fn responses_sse_stream(
     state: Arc<OpenAIPassthroughState>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<futures::stream::BoxStream<'static, Result<SseEvent, IngressError>>, IngressError> {
+    responses_stream_inner(state, headers, body, None, false)
+        .await
+        .map(|(_, events)| events)
+}
+
+async fn responses_stream_inner(
+    state: Arc<OpenAIPassthroughState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+    query: Option<&str>,
+    raw_http: bool,
+) -> Result<
+    (
+        Option<Response>,
+        futures::stream::BoxStream<'static, Result<SseEvent, IngressError>>,
+    ),
+    IngressError,
+> {
     let start_time = std::time::Instant::now();
 
     // Extract user-agent from headers for session tracking
@@ -938,35 +949,14 @@ pub(crate) async fn responses_sse_stream(
             }
         });
 
-    // Pass through only standard OpenAI API headers
-    let mut passthrough_headers = std::collections::HashMap::new();
-    let allowed_headers = [
-        "authorization",
-        "content-type",
-        "accept",
-        "user-agent",
-        "openai-beta",
-        "openai-organization",
-        "x-request-id",
-    ];
-
-    // Extract session_id header for session grouping (before filtering)
     let client_session_id = headers
         .get("session_id")
         .or_else(|| headers.get("session-id"))
         .or_else(|| headers.get("x-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if !allowed_headers.contains(&name_str.as_str()) {
-            continue;
-        }
-        if let Ok(value_str) = value.to_str() {
-            passthrough_headers.insert(name.as_str().to_lowercase(), value_str.to_string());
-        }
-    }
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut passthrough_headers = forwardable_headers(&headers);
+    passthrough_headers.remove("host");
 
     // Parse body to extract metadata for session recording
     let (model, req_json) = if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&body) {
@@ -1158,7 +1148,7 @@ pub(crate) async fn responses_sse_stream(
     // Handle streaming passthrough for responses endpoint - pass raw bytes
     let stream_response = match state
         .connector
-        .stream_passthrough_to_endpoint_bytes("responses", body, passthrough_headers)
+        .passthrough_response("responses", body, passthrough_headers, query)
         .await
     {
         Ok(response) => response,
@@ -1203,38 +1193,42 @@ pub(crate) async fn responses_sse_stream(
                 });
             }
 
-            // Handle provider errors by returning proper status codes
-            use lunaroute_egress::EgressError;
-            return match e {
-                EgressError::ProviderError {
-                    status_code,
-                    message,
-                } => {
-                    tracing::debug!("Provider returned error: {} - {}", status_code, message);
-                    // Parse error body as JSON if possible, otherwise wrap in error object
-                    let body: serde_json::Value =
-                        serde_json::from_str(&message).unwrap_or_else(|_| {
-                            serde_json::json!({
-                                "error": {
-                                    "message": message,
-                                    "type": "provider_error",
-                                    "code": status_code,
-                                }
-                            })
-                        });
-                    Err(IngressError::ProviderErrorResponse {
-                        status: status_code,
-                        body,
-                    })
-                }
-                _ => Err(IngressError::ProviderError(e.to_string())),
-            };
+            return Err(IngressError::ProviderError(e.to_string()));
         }
     };
 
-    use futures::StreamExt;
-    let byte_stream = stream_response.bytes_stream();
-    let sse_stream = eventsource_stream::EventStream::new(byte_stream);
+    if !raw_http && !stream_response.status().is_success() {
+        let status = stream_response.status().as_u16();
+        let bytes = stream_response
+            .bytes()
+            .await
+            .map_err(|error| IngressError::ProviderError(error.to_string()))?;
+        let body = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+            serde_json::json!({
+                "error":{"message":String::from_utf8_lossy(&bytes)}
+            })
+        });
+        return Err(IngressError::ProviderErrorResponse { status, body });
+    }
+    let (http_response, observed) = if raw_http {
+        let status = stream_response.status();
+        let headers = forwardable_headers(stream_response.headers());
+        let (forwarded, observed) =
+            crate::async_stream_parser::observe_bytes(stream_response.bytes_stream().boxed());
+        let mut response = Response::new(axum::body::Body::from_stream(forwarded));
+        *response.status_mut() = status;
+        *response.headers_mut() = headers;
+        (Some(response), observed)
+    } else {
+        (
+            None,
+            stream_response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())))
+                .boxed(),
+        )
+    };
+    let sse_stream = eventsource_stream::EventStream::new(observed);
 
     // Track token data and model from streaming events
     use std::sync::{Arc as StdArc, Mutex};
@@ -1525,7 +1519,7 @@ pub(crate) async fn responses_sse_stream(
         }
     });
 
-    Ok(mapped_stream.boxed())
+    Ok((http_response, mapped_stream.boxed()))
 }
 
 /// Passthrough handler for /v1/responses endpoint (OpenAI Responses API)
@@ -1533,6 +1527,7 @@ pub(crate) async fn responses_sse_stream(
 async fn responses_passthrough(
     State(state): State<Arc<OpenAIPassthroughState>>,
     headers: axum::http::HeaderMap,
+    RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Result<Response, IngressError> {
     let start_time = std::time::Instant::now();
@@ -1551,74 +1546,14 @@ async fn responses_passthrough(
             }
         });
 
-    // Pass through only standard OpenAI API headers
-    // Skip ChatGPT-specific headers (chatgpt-account-id, originator, etc.) as they're
-    // incompatible with the OpenAI API when using API key authentication
-    let mut passthrough_headers = std::collections::HashMap::new();
-
-    // Allow only these headers for OpenAI API
-    let allowed_headers = [
-        "authorization",
-        "content-type",
-        "accept",
-        "user-agent",
-        "openai-beta",         // For experimental features
-        "openai-organization", // For org-specific requests
-        "x-request-id",        // For request tracking
-    ];
-
-    // Extract session_id header for session grouping (before filtering)
     let client_session_id = headers
         .get("session_id")
         .or_else(|| headers.get("session-id"))
         .or_else(|| headers.get("x-session-id"))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-
-    // Log ALL headers received from client
-    tracing::debug!("=== Headers received from client ===");
-    for (name, value) in headers.iter() {
-        if let Ok(value_str) = value.to_str() {
-            let display_value = if name.as_str().to_lowercase() == "authorization" {
-                "[REDACTED]"
-            } else {
-                value_str
-            };
-            tracing::debug!("  {}: {}", name.as_str(), display_value);
-        }
-    }
-
-    if let Some(ref sid) = client_session_id {
-        tracing::debug!("📍 Using client-provided session ID: {}", sid);
-    }
-
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if !allowed_headers.contains(&name_str.as_str()) {
-            tracing::debug!("  Filtering out header: {}", name_str);
-            continue;
-        }
-        if let Ok(value_str) = value.to_str() {
-            // Normalize header names to lowercase for consistent lookups
-            passthrough_headers.insert(name.as_str().to_lowercase(), value_str.to_string());
-        }
-    }
-
-    // Log ALL headers being forwarded
-    tracing::debug!("=== Headers forwarding to OpenAI ===");
-    for (name, value) in &passthrough_headers {
-        let display_value = if name.to_lowercase() == "authorization" {
-            "[REDACTED]"
-        } else {
-            value
-        };
-        tracing::debug!("  {}: {}", name, display_value);
-    }
-
-    // Debug: Log if we have authorization header (header names are normalized to lowercase)
-    if !passthrough_headers.contains_key("authorization") {
-        tracing::warn!("No Authorization header received from client!");
-    }
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut passthrough_headers = forwardable_headers(&headers);
+    passthrough_headers.remove("host");
 
     // Parse body to extract metadata for session recording
     let (is_streaming, model, req_json) =
@@ -1635,7 +1570,7 @@ async fn responses_passthrough(
 
             (stream, model, Some(parsed))
         } else {
-            (false, "unknown".to_string(), None)
+            (true, "unknown".to_string(), None)
         };
 
     let before_provider = std::time::Instant::now();
@@ -1832,44 +1767,28 @@ async fn responses_passthrough(
     }
 
     if is_streaming {
-        let sse_keepalive_interval = state.sse_keepalive_interval_secs;
-        let sse_keepalive_enabled_flag = state.sse_keepalive_enabled;
-
-        let event_stream =
-            responses_sse_stream(state.clone(), headers.clone(), body.clone()).await?;
-
-        use axum::response::sse::{Event, KeepAlive, Sse};
-        use futures::StreamExt as _;
-        let axum_stream = event_stream.map(|result| match result {
-            Ok(ev) => {
-                let base = Event::default().data(ev.data);
-                let axum_ev = if ev.event.is_empty() {
-                    base
-                } else {
-                    base.event(ev.event)
-                };
-                Ok::<_, std::convert::Infallible>(axum_ev)
-            }
-            Err(e) => {
-                Ok::<_, std::convert::Infallible>(Event::default().data(format!("error: {e}")))
-            }
+        let (response, events) =
+            responses_stream_inner(state, headers, body, query.as_deref(), true).await?;
+        tokio::spawn(async move {
+            events.for_each(|_| futures::future::ready(())).await;
         });
-
-        let keepalive = if sse_keepalive_enabled_flag {
-            KeepAlive::new().interval(std::time::Duration::from_secs(sse_keepalive_interval))
-        } else {
-            KeepAlive::new().interval(std::time::Duration::from_secs(86400))
-        };
-
-        Ok(Sse::new(axum_stream).keep_alive(keepalive).into_response())
+        response.ok_or_else(|| IngressError::Internal("Missing HTTP response".into()))
     } else {
         // Send directly to OpenAI API (non-streaming) - pass raw bytes
         match state
             .connector
-            .send_passthrough_to_endpoint_bytes("responses", body, passthrough_headers)
+            .passthrough_response("responses", body, passthrough_headers, query.as_deref())
             .await
         {
-            Ok((response, _response_headers)) => {
+            Ok(upstream) => {
+                let status = upstream.status();
+                let response_headers = forwardable_headers(upstream.headers());
+                let bytes = upstream
+                    .bytes()
+                    .await
+                    .map_err(|error| IngressError::ProviderError(error.to_string()))?;
+                let response =
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
                 // Record successful response if recording is enabled
                 if let (Some(session_store), Some(session_id), Some(request_id)) = (
                     &state.session_store,
@@ -1979,8 +1898,9 @@ async fn responses_passthrough(
                             session_id: session_id_clone.clone(),
                             request_id: request_id_clone,
                             timestamp: chrono::Utc::now(),
-                            success: true,
-                            error: None,
+                            success: status.is_success(),
+                            error: (!status.is_success())
+                                .then(|| format!("HTTP {}", status.as_u16())),
                             finish_reason,
                             final_stats: Box::new(FinalSessionStats {
                                 total_duration_ms: duration.as_millis() as u64,
@@ -2011,7 +1931,10 @@ async fn responses_passthrough(
                     });
                 }
 
-                Ok(Json(response).into_response())
+                let mut response = Response::new(axum::body::Body::from(bytes));
+                *response.status_mut() = status;
+                *response.headers_mut() = response_headers;
+                Ok(response)
             }
             Err(e) => {
                 // Record error in session if recording is enabled
@@ -2053,34 +1976,7 @@ async fn responses_passthrough(
                     });
                 }
 
-                // Handle provider errors by returning proper status codes
-                use lunaroute_egress::EgressError;
-                match e {
-                    EgressError::ProviderError {
-                        status_code,
-                        message,
-                    } => {
-                        tracing::debug!("Provider returned error: {} - {}", status_code, message);
-                        // Parse error body as JSON if possible, otherwise wrap in error object
-                        let error_json = serde_json::from_str::<serde_json::Value>(&message)
-                            .unwrap_or_else(|_| {
-                                serde_json::json!({
-                                    "error": {
-                                        "message": message,
-                                        "type": "provider_error",
-                                        "code": status_code,
-                                    }
-                                })
-                            });
-                        Ok((
-                            axum::http::StatusCode::from_u16(status_code)
-                                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY),
-                            Json(error_json),
-                        )
-                            .into_response())
-                    }
-                    _ => Err(IngressError::ProviderError(e.to_string())),
-                }
+                Err(IngressError::ProviderError(e.to_string()))
             }
         }
     }
@@ -2248,17 +2144,17 @@ pub fn passthrough_router(
 }
 
 /// Passthrough handler for OpenAI→OpenAI routing (no normalization)
-/// Takes raw JSON, sends directly to OpenAI, returns raw JSON
-/// Preserves 100% API fidelity while still extracting metrics
+/// Forwards native HTTP bytes with best-effort session and metric extraction.
 pub async fn chat_completions_passthrough(
     State(state): State<Arc<OpenAIPassthroughState>>,
     headers: axum::http::HeaderMap,
-    Json(req): Json<serde_json::Value>,
+    RawQuery(query): RawQuery,
+    body: axum::body::Bytes,
 ) -> Result<Response, IngressError> {
     let start_time = std::time::Instant::now();
     tracing::debug!("OpenAI passthrough mode: skipping normalization");
 
-    let mut req = req;
+    let mut req = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
 
     // LUNAROUTE marker detection — check for provider override
     let marker_result = crate::marker::extract_marker(&req);
@@ -2337,53 +2233,8 @@ pub async fn chat_completions_passthrough(
         tracing::debug!("📍 Using client-provided session ID: {}", sid);
     }
 
-    // Pass through ALL headers from the client (except hop-by-hop headers)
-    // This allows client to provide auth headers if no API key is configured
-    let mut passthrough_headers = std::collections::HashMap::new();
-
-    // Headers that should NOT be forwarded (hop-by-hop headers per RFC 7230)
-    // Skip hop-by-hop headers + host/content-length (reqwest sets these correctly)
-    let skip_headers = [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "host",
-        "content-length",
-    ];
-
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-
-        // Skip hop-by-hop headers
-        if skip_headers.contains(&name_str.as_str()) {
-            tracing::debug!("  Skipping header: {}", name_str);
-            continue;
-        }
-
-        // Forward all other headers including authorization
-        if let Ok(value_str) = value.to_str() {
-            let display_value = if name_str == "authorization" {
-                "[REDACTED]"
-            } else {
-                value_str
-            };
-            tracing::debug!("  Forwarding header: {} = {}", name_str, display_value);
-            // Normalize header names to lowercase for consistent lookups
-            passthrough_headers.insert(name.as_str().to_lowercase(), value_str.to_string());
-        }
-    }
-
-    // Debug: Check if authorization header is present
-    if passthrough_headers.contains_key("authorization") {
-        tracing::debug!("✓ Authorization header is present in passthrough_headers");
-    } else {
-        tracing::warn!("✗ Authorization header is NOT present in passthrough_headers!");
-    }
+    let mut passthrough_headers = forwardable_headers(&headers);
+    passthrough_headers.remove("host");
 
     // Extract session ID from metadata (reserved for future use)
     let _session_id = req
@@ -2689,14 +2540,82 @@ pub async fn chat_completions_passthrough(
         }
     }
 
-    if is_streaming {
-        // Handle streaming passthrough
-        let connector = override_connector.as_ref().unwrap_or(&state.connector);
-        let stream_response = connector
-            .stream_passthrough(req, passthrough_headers)
-            .await
-            .map_err(|e| IngressError::ProviderError(e.to_string()))?;
+    let body = if marker_result != crate::marker::MarkerResult::None {
+        bytes::Bytes::from(
+            serde_json::to_vec(&req).map_err(|error| IngressError::Internal(error.to_string()))?,
+        )
+    } else {
+        body
+    };
+    let connector = override_connector.as_ref().unwrap_or(&state.connector);
+    let response_result = connector
+        .passthrough_response(
+            "chat/completions",
+            body,
+            passthrough_headers,
+            query.as_deref(),
+        )
+        .await;
+    let upstream = match response_result {
+        Ok(response) => response,
+        Err(e) => {
+            // Record error in session if recording is enabled
+            if let (Some(session_store), Some(session_id), Some(request_id)) = (
+                &state.session_store,
+                &recording_session_id,
+                &recording_request_id,
+            ) {
+                use lunaroute_session::{SessionEvent, events::FinalSessionStats};
 
+                // Record error asynchronously
+                let store_clone = session_store.clone();
+                let session_id_clone = session_id.clone();
+                let request_id_clone = request_id.clone();
+                let error_msg = e.to_string();
+                let duration_ms = start_time.elapsed().as_millis() as u64;
+                tokio::spawn(async move {
+                    let event = SessionEvent::Completed {
+                        session_id: session_id_clone,
+                        request_id: request_id_clone,
+                        timestamp: chrono::Utc::now(),
+                        success: false,
+                        error: Some(error_msg),
+                        finish_reason: None,
+                        final_stats: Box::new(FinalSessionStats {
+                            total_duration_ms: duration_ms,
+                            provider_time_ms: 0,
+                            proxy_overhead_ms: 0.0,
+                            total_tokens: Default::default(),
+                            tool_summary: Default::default(),
+                            performance: Default::default(),
+                            streaming_stats: None,
+                            estimated_cost: None,
+                        }),
+                    };
+                    if let Ok(json) = serde_json::to_value(event) {
+                        let _ = store_clone.write_event(None, json).await;
+                    }
+                });
+            }
+            return Err(IngressError::ProviderError(e.to_string()));
+        }
+    };
+
+    let status = upstream.status();
+    let upstream_is_sse = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        });
+    if is_streaming || upstream_is_sse {
+        let response_headers = forwardable_headers(upstream.headers());
         // Track streaming metrics using shared module
         use crate::streaming_metrics::StreamingMetricsTracker;
         use futures::StreamExt;
@@ -2707,8 +2626,9 @@ pub async fn chat_completions_passthrough(
         let metrics_clone = state.metrics.clone();
         let model_name_clone = model.clone();
 
-        let byte_stream = stream_response.bytes_stream();
-        let sse_stream = eventsource_stream::EventStream::new(byte_stream);
+        let (forwarded, observed) =
+            crate::async_stream_parser::observe_bytes(upstream.bytes_stream().boxed());
+        let sse_stream = eventsource_stream::EventStream::new(observed);
 
         // Collect events for async parsing (zero-copy - just storing references)
         let collected_events: Arc<std::sync::Mutex<Vec<eventsource_stream::Event>>> =
@@ -2736,7 +2656,7 @@ pub async fn chat_completions_passthrough(
                             // Log but don't fail the stream for individual parse errors
                             tracing::warn!("Failed to parse SSE event data: {}", e);
                             // Forward raw data if JSON parsing fails
-                            return Ok(Event::default().data(event.data));
+                            return Ok(());
                         }
                     };
 
@@ -2778,9 +2698,7 @@ pub async fn chat_completions_passthrough(
                         }
                     }
 
-                    // Forward the parsed event
-                    Event::default().json_data(parsed_data)
-                        .map_err(|e| IngressError::Internal(format!("Failed to create SSE event: {}", e)))
+                    Ok(())
                 }
                 Err(e) => {
                     Err(IngressError::Internal(format!("SSE stream error: {}", e)))
@@ -2796,10 +2714,6 @@ pub async fn chat_completions_passthrough(
         let before_provider_clone = before_provider;
         let metrics_for_finalize = state.metrics.clone();
         let model_for_finalize = model.clone();
-
-        // Clone SSE config before state is moved
-        let sse_keepalive_interval = state.sse_keepalive_interval_secs;
-        let sse_keepalive_enabled_flag = state.sse_keepalive_enabled;
 
         let completion_stream = tracked_stream.chain(futures::stream::once(async move {
             // Finalize metrics using shared module
@@ -2852,8 +2766,8 @@ pub async fn chat_completions_passthrough(
                         session_id: sid,
                         request_id: rid,
                         timestamp: chrono::Utc::now(),
-                        success: true,
-                        error: None,
+                        success: status.is_success(),
+                        error: (!status.is_success()).then(|| format!("HTTP {}", status.as_u16())),
                         finish_reason,
                         final_stats: Box::new(FinalSessionStats {
                             total_duration_ms: total_duration,
@@ -2898,80 +2812,25 @@ pub async fn chat_completions_passthrough(
                 }
             }
 
-            // Return empty event to complete the stream
-            Err(IngressError::Internal("Stream completed".to_string()))
+            Ok::<(), IngressError>(())
         }));
-
-        // Filter out the completion marker
-        let final_stream = completion_stream.filter_map(|result| {
-            futures::future::ready(match result {
-                Ok(event) => Some(Ok(event)),
-                Err(e) if e.to_string().contains("Stream completed") => None,
-                Err(e) => Some(Err(e)),
-            })
+        tokio::spawn(async move {
+            completion_stream
+                .for_each(|_| futures::future::ready(()))
+                .await;
         });
-
-        // Create SSE response with configured keepalive
-        let sse_keepalive = if sse_keepalive_enabled_flag {
-            KeepAlive::new().interval(std::time::Duration::from_secs(sse_keepalive_interval))
-        } else {
-            // Disable keepalive by setting a very long interval
-            KeepAlive::new().interval(std::time::Duration::from_secs(86400)) // 24 hours
-        };
-
-        let sse_response = Sse::new(final_stream).keep_alive(sse_keepalive);
-
-        return Ok(sse_response.into_response());
+        let mut response = Response::new(axum::body::Body::from_stream(forwarded));
+        *response.status_mut() = status;
+        *response.headers_mut() = response_headers;
+        return Ok(response);
     }
 
-    // Send directly to OpenAI API (non-streaming)
-    let connector = override_connector.as_ref().unwrap_or(&state.connector);
-    let response_result = connector.send_passthrough(req, passthrough_headers).await;
-
-    let (response, response_headers) = match response_result {
-        Ok((resp, headers)) => (resp, headers),
-        Err(e) => {
-            // Record error in session if recording is enabled
-            if let (Some(session_store), Some(session_id), Some(request_id)) = (
-                &state.session_store,
-                &recording_session_id,
-                &recording_request_id,
-            ) {
-                use lunaroute_session::{SessionEvent, events::FinalSessionStats};
-
-                // Record error asynchronously
-                let store_clone = session_store.clone();
-                let session_id_clone = session_id.clone();
-                let request_id_clone = request_id.clone();
-                let error_msg = e.to_string();
-                let duration_ms = start_time.elapsed().as_millis() as u64;
-                tokio::spawn(async move {
-                    let event = SessionEvent::Completed {
-                        session_id: session_id_clone,
-                        request_id: request_id_clone,
-                        timestamp: chrono::Utc::now(),
-                        success: false,
-                        error: Some(error_msg),
-                        finish_reason: None,
-                        final_stats: Box::new(FinalSessionStats {
-                            total_duration_ms: duration_ms,
-                            provider_time_ms: 0,
-                            proxy_overhead_ms: 0.0,
-                            total_tokens: Default::default(),
-                            tool_summary: Default::default(),
-                            performance: Default::default(),
-                            streaming_stats: None,
-                            estimated_cost: None,
-                        }),
-                    };
-                    if let Ok(json) = serde_json::to_value(event) {
-                        let _ = store_clone.write_event(None, json).await;
-                    }
-                });
-            }
-            return Err(IngressError::ProviderError(e.to_string()));
-        }
-    };
+    let response_status = upstream.status();
+    let response_headers = forwardable_headers(upstream.headers());
+    let response_bytes = upstream
+        .bytes()
+        .await
+        .map_err(|error| IngressError::ProviderError(error.to_string()))?;
 
     let after_provider = std::time::Instant::now();
     let provider_time = after_provider.duration_since(before_provider);
@@ -2980,17 +2839,39 @@ pub async fn chat_completions_passthrough(
         provider_time.as_secs_f64() * 1000.0
     );
 
-    // Build response with headers from OpenAI's API FIRST (zero latency)
-    let mut axum_response = Json(response.clone()).into_response();
-    let axum_headers = axum_response.headers_mut();
+    let mut axum_response = Response::new(axum::body::Body::from(response_bytes.clone()));
+    *axum_response.status_mut() = response_status;
+    *axum_response.headers_mut() = response_headers.clone();
 
-    // Forward OpenAI's response headers (rate limits, request-id, etc.)
-    for (name, value) in &response_headers {
-        if let Ok(header_name) = axum::http::HeaderName::from_bytes(name.as_bytes())
-            && let Ok(header_value) = axum::http::HeaderValue::from_str(value)
-        {
-            axum_headers.insert(header_name, header_value);
-        }
+    if let (Some(store), Some(session_id), Some(request_id)) = (
+        state.session_store.clone(),
+        recording_session_id.clone(),
+        recording_request_id.clone(),
+    ) {
+        tokio::spawn(async move {
+            let event = lunaroute_session::SessionEvent::Completed {
+                session_id,
+                request_id,
+                timestamp: chrono::Utc::now(),
+                success: response_status.is_success(),
+                error: (!response_status.is_success())
+                    .then(|| format!("HTTP {}", response_status.as_u16())),
+                finish_reason: None,
+                final_stats: Box::new(lunaroute_session::events::FinalSessionStats {
+                    total_duration_ms: start_time.elapsed().as_millis() as u64,
+                    provider_time_ms: before_provider.elapsed().as_millis() as u64,
+                    proxy_overhead_ms: 0.0,
+                    total_tokens: Default::default(),
+                    tool_summary: Default::default(),
+                    performance: Default::default(),
+                    streaming_stats: None,
+                    estimated_cost: None,
+                }),
+            };
+            if let Ok(event) = serde_json::to_value(event) {
+                let _ = store.write_event(None, event).await;
+            }
+        });
     }
 
     // Spawn async parsing task to extract tool calls (zero latency for client)
@@ -2999,7 +2880,12 @@ pub async fn chat_completions_passthrough(
         recording_session_id.clone(),
         recording_request_id.clone(),
     ) {
-        let response_clone = response.clone();
+        let encoded_response = response_bytes;
+        let encoding = response_headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let user_agent_clone = user_agent.clone();
         let tool_call_mapper = state.tool_call_mapper.clone();
 
@@ -3007,6 +2893,14 @@ pub async fn chat_completions_passthrough(
             // Catch and log any panics/errors in background parsing
             let session_id_for_error = session_id.clone();
             let parse_result = std::panic::AssertUnwindSafe(async move {
+                let decoded = crate::async_stream_parser::decode_response_body(
+                    &encoded_response,
+                    &encoding,
+                    32 * 1024 * 1024,
+                )
+                .unwrap_or_default();
+                let response_clone =
+                    serde_json::from_slice::<serde_json::Value>(&decoded).unwrap_or_default();
                 // Extract tool calls from response
                 let mut tool_calls_map = std::collections::HashMap::new();
 

@@ -1415,7 +1415,7 @@ async fn test_anthropic_sse_hop_headers_over_http() {
     for recording in [false, true] {
         let upstream = TestHttpServer::start(axum::Router::new().route("/v1/messages",
             axum::routing::post(|headers: axum::http::HeaderMap| async move {
-                assert!(!headers.contains_key("accept-encoding"));
+                assert_eq!(headers["accept-encoding"], "gzip, br");
                 let sse = [
                     json!({"type":"message_start","message":{"model":"claude-test","usage":{"input_tokens":10}}}),
                     json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}),
@@ -1519,4 +1519,183 @@ async fn test_anthropic_recording_size_limit_preserves_http_body() {
     let events = wait_for_stream_completion(&store).await;
     assert!(matches!(assert_single_completion(&events, false),
         SessionEvent::Completed { error: Some(error), .. } if error.contains("recording limit")));
+}
+
+async fn native_http_proxy(
+    endpoint: &str,
+    upstream: &str,
+    store: Option<Arc<dyn lunaroute_core::session_store::SessionStore>>,
+) -> TestHttpServer {
+    let app = if endpoint == "/v1/messages" {
+        lunaroute_ingress::anthropic::passthrough_router(
+            Arc::new(
+                AnthropicConnector::new(AnthropicConfig::new("").with_base_url(upstream)).unwrap(),
+            ),
+            None,
+            None,
+            store,
+            15,
+            false,
+            None,
+        )
+    } else {
+        lunaroute_ingress::openai::passthrough_router(
+            Arc::new(
+                OpenAIConnector::new(OpenAIConfig::new("").with_base_url(format!("{upstream}/v1")))
+                    .await
+                    .unwrap(),
+            ),
+            None,
+            None,
+            store,
+            15,
+            false,
+            None,
+        )
+    };
+    TestHttpServer::start(app).await
+}
+
+#[tokio::test]
+async fn native_http_preserves_unknown_payloads_headers_events_and_errors() {
+    for endpoint in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
+        for recording in [false, true] {
+            for (status, content_type, payload, streaming) in [
+                (200, "application/json", b" {\"future\":{\"large_integer\":18446744073709551616123456789},\"stop_reason\":\"future_stop\"} ".as_slice(), false),
+                (200, "text/event-stream", b": heartbeat\r\nevent: future_event\r\nid: future-id\r\nretry: 1000\r\ndata: {\"future\":true}\r\n\r\nevent: opaque_event\r\ndata: not-json\r\n\r\n".as_slice(), true),
+                (202, "application/x-future", b"\xff\x00future\n".as_slice(), false),
+                (503, "application/x-future-error", b" upstream future error \xff\n".as_slice(), true),
+            ] {
+                let upstream = MockServer::start().await;
+                Mock::given(method("POST")).and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(status)
+                        .set_body_bytes(payload).insert_header("content-type", content_type)
+                        .insert_header("x-future-response", "preserved")
+                        .insert_header("request-id", "req_future").insert_header("retry-after", "90")
+                        .append_header("set-cookie", "first=1").append_header("set-cookie", "second=2"))
+                    .expect(1).mount(&upstream).await;
+                let store = Arc::new(InMemorySessionStore::new());
+                let proxy = native_http_proxy(endpoint, &upstream.uri(), recording.then(|| store as Arc<dyn lunaroute_core::session_store::SessionStore>)).await;
+                let request = format!(" {{\"model\":\"future-model\",\"stream\":{streaming},\"messages\":[{{\"role\":\"user\",\"content\":[{{\"type\":\"future_block\",\"value\":18446744073709551616123456789}}]}}],\"future_option\":true}} ");
+                let response = raw_http_client().post(format!("{}{endpoint}?beta=true&future=a%2Fb&future=a+b", proxy.url))
+                    .header("content-type", "application/json").header("authorization", "Bearer client-token")
+                    .header("x-future-request", "preserved")
+                    .header("x-future-repeated", "first").header("x-future-repeated", "second")
+                    .body(request.clone()).send().await.unwrap();
+                assert_eq!(response.status().as_u16(), status, "{endpoint}");
+                assert_eq!(response.headers()["content-type"], content_type);
+                assert_eq!(response.headers()["x-future-response"], "preserved");
+                assert_eq!(response.headers()["request-id"], "req_future");
+                assert_eq!(response.headers()["retry-after"], "90");
+                assert_eq!(response.headers().get_all("set-cookie").iter().count(), 2);
+                assert_eq!(response.bytes().await.unwrap(), payload, "{endpoint}");
+                let requests = upstream.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].body, request.as_bytes(), "{endpoint}");
+                assert_eq!(requests[0].url.query(), Some("beta=true&future=a%2Fb&future=a+b"));
+                assert_eq!(requests[0].headers["x-future-request"], "preserved");
+                assert_eq!(requests[0].headers.get_all("x-future-repeated").iter().count(), 2);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_http_streams_compressed_requests_and_responses_without_parsing_them() {
+    for endpoint in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
+        let request = compress_anthropic_body(
+            b"{\"model\":\"future-model\",\"stream\":true,\"future\":true}",
+            "gzip",
+        );
+        let first =
+            compress_anthropic_body(b"event: future_event\ndata: {\"future\":true}\n\n", "gzip");
+        let first_clone = first.clone();
+        let request_clone = request.clone();
+        let upstream = TestHttpServer::start(axum::Router::new().route(
+            endpoint,
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let first = first_clone.clone();
+                    let expected = request_clone.clone();
+                    async move {
+                        assert_eq!(headers["content-encoding"], "gzip");
+                        assert_eq!(body, expected);
+                        let stream =
+                            futures::stream::once(async move { Ok::<_, std::io::Error>(first) })
+                                .chain(futures::stream::pending());
+                        axum::http::Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .header("content-encoding", "gzip")
+                            .body(Body::from_stream(stream))
+                            .unwrap()
+                    }
+                },
+            ),
+        ))
+        .await;
+        let proxy = native_http_proxy(
+            endpoint,
+            &upstream.url,
+            Some(Arc::new(InMemorySessionStore::new())),
+        )
+        .await;
+        let response = raw_http_client()
+            .post(format!("{}{endpoint}", proxy.url))
+            .header("content-type", "application/json")
+            .header("content-encoding", "gzip")
+            .body(request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        let mut stream = response.bytes_stream();
+        let actual = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("first bytes must arrive before the upstream stream closes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, first, "{endpoint}");
+    }
+}
+
+#[tokio::test]
+async fn active_passthrough_streams_outlive_the_read_idle_timeout() {
+    let upstream = TestHttpServer::start(axum::Router::new().route(
+        "/v1/messages",
+        axum::routing::post(|| async {
+            let stream = futures::stream::unfold(0, |index| async move {
+                if index == 8 {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Some((Ok::<_, std::io::Error>("data: future\n\n"), index + 1))
+            });
+            axum::http::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    ))
+    .await;
+    let mut config = AnthropicConfig::new("").with_base_url(&upstream.url);
+    config.client_config.timeout_secs = 1;
+    let connector = AnthropicConnector::new(config).unwrap();
+    let response = connector
+        .passthrough_response(
+            axum::body::Bytes::from_static(b"{}"),
+            Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut stream = response.bytes_stream();
+    let mut chunks = 0;
+    while let Some(chunk) = stream.next().await {
+        assert!(!chunk.unwrap().is_empty());
+        chunks += 1;
+    }
+    assert_eq!(
+        chunks, 8,
+        "each read arrives before the idle timeout even though the whole response takes longer"
+    );
 }

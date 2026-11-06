@@ -1,6 +1,9 @@
 //! Anthropic ingress adapter
 
-use crate::types::{IngressError, IngressResult};
+use crate::{
+    bypass::forwardable_headers,
+    types::{IngressError, IngressResult},
+};
 use axum::{
     Router,
     extract::{Json, RawQuery, State},
@@ -1171,36 +1174,6 @@ struct PassthroughStreamStatus {
     error: Option<String>,
 }
 
-/// Headers for a new HTTP connection and body framing chosen by the server.
-fn forwardable_headers(headers: &axum::http::HeaderMap) -> axum::http::HeaderMap {
-    let mut forwarded = headers.clone();
-    for value in headers.get_all(axum::http::header::CONNECTION) {
-        if let Ok(value) = value.to_str() {
-            for name in value.split(',') {
-                if let Ok(name) = axum::http::HeaderName::from_bytes(name.trim().as_bytes()) {
-                    forwarded.remove(name);
-                }
-            }
-        }
-    }
-    for name in [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "proxy-connection",
-        "te",
-        "trailer",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
-        "content-length",
-    ] {
-        forwarded.remove(name);
-    }
-    forwarded
-}
-
 async fn record_passthrough_error(
     state: &PassthroughState,
     session_id: &Option<String>,
@@ -1422,18 +1395,17 @@ fn spawn_passthrough_response_recording(
 }
 
 /// Passthrough handler for Anthropic→Anthropic routing (no normalization)
-/// Takes raw JSON, sends directly to Anthropic, returns raw JSON
-/// Preserves 100% API fidelity while still extracting metrics
+/// Forwards native HTTP bytes with best-effort session and metric extraction.
 pub async fn messages_passthrough(
     State(state): State<Arc<PassthroughState>>,
     headers: axum::http::HeaderMap,
     RawQuery(query): RawQuery,
-    Json(req): Json<serde_json::Value>,
+    body: axum::body::Bytes,
 ) -> Result<Response, IngressError> {
     let start_time = std::time::Instant::now();
     tracing::debug!("Anthropic passthrough mode: skipping normalization");
 
-    let mut req = req;
+    let mut req = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
 
     // LUNAROUTE marker detection — check for provider override
     let marker_result = crate::marker::extract_marker(&req);
@@ -1514,15 +1486,7 @@ pub async fn messages_passthrough(
 
     let mut request_headers = forwardable_headers(&headers);
     request_headers.remove("host");
-    let passthrough_headers = request_headers
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.to_string(), value.to_string()))
-        })
-        .collect();
+    let passthrough_headers = request_headers;
 
     let is_streaming = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -1856,26 +1820,45 @@ pub async fn messages_passthrough(
         }
     }
 
-    if is_streaming {
-        // Handle streaming passthrough
-        let connector = override_connector.as_ref().unwrap_or(&state.connector);
-        let stream_response = match connector
-            .stream_passthrough_with_query(req, passthrough_headers, query.as_deref())
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                record_passthrough_error(
-                    &state,
-                    &recording_session_id,
-                    &recording_request_id,
-                    start_time,
-                    error.to_string(),
-                )
-                .await;
-                return Err(IngressError::ProviderError(error.to_string()));
-            }
-        };
+    let body = if marker_result != crate::marker::MarkerResult::None {
+        bytes::Bytes::from(
+            serde_json::to_vec(&req).map_err(|error| IngressError::Internal(error.to_string()))?,
+        )
+    } else {
+        body
+    };
+    let connector = override_connector.as_ref().unwrap_or(&state.connector);
+    let upstream = match connector
+        .passthrough_response(body, passthrough_headers, query.as_deref())
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            record_passthrough_error(
+                &state,
+                &recording_session_id,
+                &recording_request_id,
+                start_time,
+                error.to_string(),
+            )
+            .await;
+            return Err(IngressError::ProviderError(error.to_string()));
+        }
+    };
+    let upstream_is_sse = upstream
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        });
+    if is_streaming || upstream_is_sse {
+        let stream_response = upstream;
 
         // If the response is an error (non-2xx), pass it through as a raw response
         // instead of trying to set up SSE streaming. Error responses from Anthropic
@@ -1919,10 +1902,8 @@ pub async fn messages_passthrough(
             return Ok(axum_response);
         }
 
-        let mut response_headers = forwardable_headers(stream_response.headers());
-        // Axum reconstructs SSE, so only its content metadata describes the new body.
-        response_headers.remove("content-encoding");
-        response_headers.remove("content-type");
+        let response_status = stream_response.status();
+        let response_headers = forwardable_headers(stream_response.headers());
 
         // Track streaming metrics using shared module
         use crate::streaming_metrics::StreamingMetricsTracker;
@@ -1934,8 +1915,9 @@ pub async fn messages_passthrough(
         let metrics_clone = state.metrics.clone();
         let model_clone = model.clone();
 
-        let byte_stream = stream_response.bytes_stream();
-        let sse_stream = eventsource_stream::EventStream::new(byte_stream);
+        let (forwarded, observed) =
+            crate::async_stream_parser::observe_bytes(stream_response.bytes_stream().boxed());
+        let sse_stream = eventsource_stream::EventStream::new(observed);
 
         let stream_status = Arc::new(std::sync::Mutex::new(PassthroughStreamStatus::default()));
         let parser_sender = if let (Some(session_store), Some(session_id), Some(request_id)) = (
@@ -2151,33 +2133,21 @@ pub async fn messages_passthrough(
             }
         });
 
-        // Create SSE response with configured keepalive
-        let sse_keepalive = if state.sse_keepalive_enabled {
-            KeepAlive::new().interval(std::time::Duration::from_secs(
-                state.sse_keepalive_interval_secs,
-            ))
-        } else {
-            // Disable keepalive by setting a very long interval
-            KeepAlive::new().interval(std::time::Duration::from_secs(86400)) // 24 hours
-        };
-
-        let sse_response = Sse::new(tracked_stream).keep_alive(sse_keepalive);
-        let mut response = sse_response.into_response();
-
-        // Add the response headers from Anthropic
-        response.headers_mut().extend(response_headers);
-
+        tokio::spawn(async move {
+            tracked_stream
+                .for_each(|_| futures::future::ready(()))
+                .await;
+        });
+        let mut response = Response::new(axum::body::Body::from_stream(forwarded));
+        *response.status_mut() = response_status;
+        *response.headers_mut() = response_headers;
         return Ok(response);
     }
 
-    // Send directly to Anthropic API (non-streaming)
-    let connector = override_connector.as_ref().unwrap_or(&state.connector);
-    let response_result = connector
-        .send_passthrough_with_query(req, passthrough_headers, query.as_deref())
-        .await;
-
-    let (response_status, raw_response_bytes, response_headers) = match response_result {
-        Ok((status, bytes, headers)) => (status, bytes, headers),
+    let response_status = upstream.status().as_u16();
+    let response_headers = upstream.headers().clone();
+    let raw_response_bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
         Err(error) => {
             record_passthrough_error(
                 &state,
